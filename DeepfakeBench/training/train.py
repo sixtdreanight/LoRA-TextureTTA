@@ -35,9 +35,6 @@ from dataset import *
 from metrics.utils import parse_metric_for_print
 from logger import create_logger, RankFilter
 
-from dataset.abstract_dataset import DeepfakeAbstractBaseDataset
-
-
 
 parser = argparse.ArgumentParser(description='Process some paths.')
 parser.add_argument('--detector_path', type=str,
