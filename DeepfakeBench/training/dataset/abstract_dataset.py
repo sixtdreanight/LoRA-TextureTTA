@@ -163,7 +163,6 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         # Record video name for video-level metrics
         video_name_list = []
 
-        # breakpoint()
         # Try to get the dataset information from the JSON file
         if not os.path.exists(self.config['dataset_json_folder']):
            self.config['dataset_json_folder'] = self.config['dataset_json_folder'].replace('/Youtu_Pangu_Security/public', '/Youtu_Pangu_Security_Public')
@@ -304,6 +303,11 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         Raises:
             ValueError: If the loaded image is None.
         """
+        file_path = file_path.replace('\\', '/')
+        base_data_path = '/home/user1/effort/data'
+        if not file_path.startswith('/'):
+            file_path = os.path.join(base_data_path, file_path)
+        
         size = self.config['resolution'] # if self.mode == "train" else self.config['resolution']
         if not self.lmdb:
             assert os.path.exists(file_path), f"{file_path} does not exist"
@@ -480,11 +484,6 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         augmentation_seed = None
 
         # print(image_paths)
-        base_dir = os.path.abspath("/home/user1/effort/data/")  # 先转为绝对路径，避免相对路径歧义
-        image_paths = [os.path.join(base_dir, os.path.normpath(i).replace("\\", "/")) for i in image_paths]
-        # image_paths=[os.path.join('../../effort/data/',i) for i in image_paths]
-        # breakpoint()
-        # exit()
 
         for i, image_path in enumerate(image_paths):
 
