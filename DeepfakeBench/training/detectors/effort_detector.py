@@ -21,41 +21,175 @@ from detectors import DETECTOR
 from networks import BACKBONE
 from loss import LOSSFUNC
 
-import loralib as lora
+#import loralib as lora
 from transformers import AutoProcessor, CLIPModel, ViTModel, ViTConfig
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Method 1: Original Effort (SVD with residual learning)
-# =============================================================================
+class Linear(nn.Module):
+    def __init__(self,in_features,out_features,r=0,lora_alpha=1,merge_weight=False,bias=True):
+        super(Linear,self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.merge_weight = merge_weight
+        self.merged = False
+        
+        self.weight = nn.Parameter(torch.Tensor(out_features,in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_Parameter('bias',None)
+            
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.Tensor(in_features,r))
+            self.lora_B = nn.Parameter(torch.Tensor(r,out_features))
+            self.scaling = lora_alpha / r
+        else:
+            self.register('lora_A',None)
+            self.register('lora_B',None)
+        
+        self.reset_parameters()
+        
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+            
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+        
+        if self.r > 0:
+            nn.init.normal_(self.lora_A, mean=0, std=0.02)
+            nn.init.zeros_(self.lora_B)    
+    
+    def forward(self,x):
+        original = F.linear(x,self.weight,self.bias)
+        
+        if self.r > 0 and not self.merged:
+            lora_output = (x @ self.lora_A @ self.lora_B) * self.scaling
+            return original + lora_output
+        
+        return original
+    
+    def train(self,mode=True):
+        if self.merge_weight:
+            if mode:
+                if self.merged:
+                    self._unmerge_weights()
+            
+            else:
+                if not self.merged:
+                    self._merge_weights()
+        
+        return super(Linear,self).train(mode) 
+    
+    def _merge_weights(self):
+        if self.r > 0 and not self.merged:
+            delta_weight = (self.lora_A @ self.lora_B) * self.scaling
+            self.weight.data += delta_weight.T
+            self.merged = True
+            
+    def _unmerge_weights(self):
+        if self.r > 0 and self.merged:
+            delta_weight = (self.lora_A @ self.lora_B) * self.scaling
+            self.weight.data -= delta_weight.T
+            self.merged = False
+            
+class LoRAModule:
+    Linear = Linear
+    
+    @staticmethod
+    def mark_only_lora_as_trainable(module):
+        for name, param in module.named_parameters():
+            if 'lora_' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+    @staticmethod
+    def lora_state_dict(module):
+        state_dict = {}
+        for name, param in module.named_parameters():
+            if 'lora_' in name:
+                state_dict[name] = param.data.clone()
+        return state_dict
+    
+lora = LoRAModule()
+        
+        
 @DETECTOR.register_module(module_name='effort')
 class EffortDetector(nn.Module):
     def __init__(self, config=None):
         super(EffortDetector, self).__init__()
         self.config = config
         self.backbone = self.build_backbone(config)
-        self.head = nn.Linear(1024, 2)
+        #self.head = nn.Linear(1024, 2)
+        self.head = lora.Linear(
+            in_features=1024,
+            out_features=2,
+            r=2,
+            lora_alpha=8,
+            merge_weight=False,
+            bias=True
+        )
         self.loss_func = nn.CrossEntropyLoss()
         self.prob, self.label = [], []
         self.correct, self.total = 0, 0
 
     def build_backbone(self, config):
-        # Load CLIP model from config
-        clip_path = config.get('clip_path', "../models--openai--clip-vit-large-patch14")
-        clip_model = CLIPModel.from_pretrained(clip_path)
+        # ⚠⚠⚠ Download CLIP model using the below link
+        # https://drive.google.com/drive/folders/1fm3Jd8lFMiSP1qgdmsxfqlJZGpr_bXsx?usp=drive_link
         
-        # Get SVD configuration from method_config
-        method_config = config.get('method_config', {})
-        if method_config.get('type') == 'svd':
-            svd_config = method_config.get('svd', {})
-            r = svd_config.get('svd_r', 1023)
-        else:
-            r = 1023  # default
+        # mean: [0.48145466, 0.4578275, 0.40821073]
+        # std: [0.26862954, 0.26130258, 0.27577711]
         
-        # Apply SVD to self_attn layers
-        clip_model.vision_model = apply_svd_residual_to_self_attn(clip_model.vision_model, r=r)
+        # ViT-L/14 224*224
+        clip_model = CLIPModel.from_pretrained("/home/user1/effort/effort_main/Effort-AIGI-Detection-main/DeepfakeBench/training/models--openai--clip-vit-large-patch14")  # the path of this folder in your disk (download from the above link)
+
+
+        # ViT-L/14 224*224: 1024-1
+        # clip_model.vision_model = apply_svd_residual_to_self_attn(clip_model.vision_model, r=1024-1)
+
+
+        for param in clip_model.vision_model.parameters():
+            param.requires_grad = False
+
+   
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+        
+        for name, module in clip_model.vision_model.named_modules():
+
+            if any(target in name for target in target_modules) and isinstance(module, nn.Linear):
+     
+                parent_name = ".".join(name.split(".")[:-1])
+                child_name = name.split(".")[-1]
+                parent = clip_model.vision_model
+                for part in parent_name.split("."):
+                    if part:
+                        parent = getattr(parent, part)
+            
+                lora_layer = lora.Linear(
+                    module.in_features, 
+                    module.out_features, 
+                    r=4,  # LoRA rank
+                    lora_alpha=16,  # LoRA alpha
+                    merge_weight=False
+                )
+      
+                lora_layer.weight.data.copy_(module.weight.data)
+                if module.bias is not None:
+                    lora_layer.bias.data.copy_(module.bias.data)
+                
+                setattr(parent, child_name, lora_layer)
+
+        for name, param in clip_model.vision_model.named_parameters():
+            if 'lora_' not in name: 
+                param.requires_grad = False
         
         return clip_model.vision_model
 
@@ -66,258 +200,118 @@ class EffortDetector(nn.Module):
     def classifier(self, features: torch.tensor) -> torch.tensor:
         return self.head(features)
 
-    def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
-        pred = pred_dict['cls']
-    
-        loss_cls = self.loss_func(pred, label)
-    
-        config = self.config.get('method_config', {})
-        svd_config = config.get('svd', {})
-        lambda_orth = svd_config.get('lambda_orth', 1.0)
-        lambda_ksv = svd_config.get('lambda_ksv', 1.0)
-    
-        loss_orth, loss_ksv = 0.0, 0.0
-        num_svd_modules = 0
-    
-        for module in self.backbone.modules():
+    #def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
+    #    label = data_dict['label']
+    #    pred = pred_dict['cls']
+    #    loss = self.loss_func(pred, label)
+    #    
+    #    if self.training:
+    #        # Regularization term
+    #        lambda_reg = 1.0
+    #        reg_term = 0.0
+    #        num_reg = 0
+    #        for module in self.backbone.modules():
+    #            if isinstance(module, SVDResidualLinear):
+    #                reg_term += module.compute_orthogonal_loss()
+    #                reg_term += module.compute_keepsv_loss()
+    #                num_reg += 1
+    #        
+    #        loss += lambda_reg * reg_term / num_reg
+    #    
+    #    loss_dict = {'overall': loss}
+    #    return loss_dict
+
+    def compute_weight_loss(self):
+        weight_sum_dict = {}
+        num_weight_dict = {}
+        for name, module in self.backbone.named_modules():
             if isinstance(module, SVDResidualLinear):
-                loss_orth += module.compute_orthogonal_loss()
-                loss_ksv += module.compute_keepsv_loss()
-                num_svd_modules += 1
-    
-        if num_svd_modules > 0:
-            loss_orth = loss_orth / num_svd_modules
-            loss_ksv = loss_ksv / num_svd_modules
-            loss_reg = lambda_orth * loss_orth + lambda_ksv * loss_ksv
-        else:
-            loss_reg = 0.0
-    
-        loss_total = loss_cls + loss_reg
-    
-        mask_real = label == 0
-        mask_fake = label == 1
-
-        loss_real = self.loss_func(pred[mask_real], label[mask_real]) if mask_real.sum() > 0 else torch.tensor(0.0, device=pred.device)
-        loss_fake = self.loss_func(pred[mask_fake], label[mask_fake]) if mask_fake.sum() > 0 else torch.tensor(0.0, device=pred.device)
-
-        return {
-            'overall': loss_total,
-            'cls_loss': loss_cls,
-            'orth_loss': loss_orth,
-            'ksv_loss': loss_ksv,
-            'real_loss': loss_real,
-            'fake_loss': loss_fake,
-        }
-
-    def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
-        pred = pred_dict['cls']
-        auc, eer, acc, ap = calculate_metrics_for_train(label.detach(), pred.detach())
-        return {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
-
-    def forward(self, data_dict: dict, inference=False) -> dict:
-        features = self.features(data_dict)
-        pred = self.classifier(features)
-        prob = torch.softmax(pred, dim=1)[:, 1]
-        return {'cls': pred, 'prob': prob, 'feat': features}
-
-
-# =============================================================================
-# Method 2: SVD + LoRA (Initialize with SVD, train with LoRA only)
-# =============================================================================
-@DETECTOR.register_module(module_name='effort_svd_lora')
-class EffortSVDLoRADetector(nn.Module):
-    def __init__(self, config=None):
-        super(EffortSVDLoRADetector, self).__init__()
-        self.config = config
-        self.backbone = self.build_backbone(config)
-        self.head = nn.Linear(1024, 2)
-        self.loss_func = nn.CrossEntropyLoss()
-        self.prob, self.label = [], []
-        self.correct, self.total = 0, 0
-
-    def build_backbone(self, config):
-        # Load CLIP model from config
-        clip_path = config.get('clip_path', "../models--openai--clip-vit-large-patch14")
-        clip_model = CLIPModel.from_pretrained(clip_path)
+                weight_curr = module.compute_current_weight()
+                if str(weight_curr.size()) not in weight_sum_dict.keys():
+                    weight_sum_dict[str(weight_curr.size())] = weight_curr
+                    num_weight_dict[str(weight_curr.size())] = 1
+                else:
+                    weight_sum_dict[str(weight_curr.size())] += weight_curr
+                    num_weight_dict[str(weight_curr.size())] += 1
         
-        # Get SVD+LoRA configuration from method_config
-        method_config = config.get('method_config', {})
-        if method_config.get('type') == 'lora':
-            svd_lora_config = method_config.get('svd_lora', {})
-            r = svd_lora_config.get('svd_r', 1023)
-            lora_rank = svd_lora_config.get('lora_rank', 4)
-            lora_alpha = svd_lora_config.get('lora_alpha', 12)
-            lora_dropout = svd_lora_config.get('lora_dropout', 0.1)
-        else:
-            r = 1023
-            lora_rank = 4
-            lora_alpha = 12
-            lora_dropout = 0.1
-        
-        # Apply SVD initialization and add LoRA
-        clip_model.vision_model = apply_svd_lora_to_self_attn(
-            clip_model.vision_model, 
-            r=r,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout
-        )
-        
-        return clip_model.vision_model
-
-    def features(self, data_dict: dict) -> torch.tensor:
-        feat = self.backbone(data_dict['image'])['pooler_output']
-        return feat
-
-    def classifier(self, features: torch.tensor) -> torch.tensor:
-        return self.head(features)
+        loss2 = 0.0
+        for k in weight_sum_dict.keys():
+            _, S_sum, _ = torch.linalg.svd(weight_sum_dict[k], full_matrices=False)
+            loss2 += -torch.mean(S_sum)
+        loss2 /= len(weight_sum_dict.keys())
+        return loss2
 
     def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
-        pred = pred_dict['cls']
+        label = data_dict['label']  # Tensor of shape [batch_size]
+        pred = pred_dict['cls']     # Tensor of shape [batch_size, num_classes]
+
+        # Compute overall loss using all samples
         loss = self.loss_func(pred, label)
 
-        # Separate real/fake losses
-        mask_real = label == 0
-        mask_fake = label == 1
+        # Create masks for real and fake classes
+        mask_real = label == 0  # Boolean tensor
+        mask_fake = label == 1  # Boolean tensor
 
+        # Compute loss for real class
         if mask_real.sum() > 0:
             pred_real = pred[mask_real]
             label_real = label[mask_real]
             loss_real = self.loss_func(pred_real, label_real)
         else:
+            # No real samples in batch
             loss_real = torch.tensor(0.0, device=pred.device)
 
+        # Compute loss for fake class
         if mask_fake.sum() > 0:
             pred_fake = pred[mask_fake]
             label_fake = label[mask_fake]
             loss_fake = self.loss_func(pred_fake, label_fake)
         else:
+            # No fake samples in batch
             loss_fake = torch.tensor(0.0, device=pred.device)
+        
 
-        return {
+        # loss2 = self.compute_weight_loss()
+        # overall_loss = loss + loss2
+
+        # Return a dictionary with all losses
+        loss_dict = {
             'overall': loss,
             'real_loss': loss_real,
             'fake_loss': loss_fake,
+            # 'erank_loss': loss2
         }
+        return loss_dict
 
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
         label = data_dict['label']
         pred = pred_dict['cls']
+        # compute metrics for batch data
         auc, eer, acc, ap = calculate_metrics_for_train(label.detach(), pred.detach())
-        return {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
+        metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
+        return metric_batch_dict
 
     def forward(self, data_dict: dict, inference=False) -> dict:
+        # get the features by backbone
         features = self.features(data_dict)
+        # get the prediction by classifier
         pred = self.classifier(features)
+        # get the probability of the pred
         prob = torch.softmax(pred, dim=1)[:, 1]
-        return {'cls': pred, 'prob': prob, 'feat': features}
+        # build the prediction dict for each output
+        pred_dict = {'cls': pred, 'prob': prob, 'feat': features}
 
+        return pred_dict
 
-# =============================================================================
-# Method 3: Pure LoRA
-# =============================================================================
-@DETECTOR.register_module(module_name='effort_lora')
-class EffortLoRADetector(nn.Module):
-    def __init__(self, config=None):
-        super(EffortLoRADetector, self).__init__()
-        self.config = config
-        self.backbone = self.build_backbone(config)
-        self.head = nn.Linear(1024, 2)
-        self.loss_func = nn.CrossEntropyLoss()
-        self.prob, self.label = [], []
-        self.correct, self.total = 0, 0
-
-    def build_backbone(self, config):
-        # Load CLIP model from config
-        clip_path = config.get('clip_path', "../models--openai--clip-vit-large-patch14")
-        clip_model = CLIPModel.from_pretrained(clip_path)
-        
-        # Get LoRA configuration from method_config
-        method_config = config.get('method_config', {})
-        if method_config.get('type') == 'lora':
-            lora_config = method_config.get('lora', {})
-            lora_rank = lora_config.get('lora_rank', 4)
-            lora_alpha = lora_config.get('lora_alpha', 12)
-            lora_dropout = lora_config.get('lora_dropout', 0.1)
-        else:
-            lora_rank = 4
-            lora_alpha = 12
-            lora_dropout = 0.1
-        
-        # Apply LoRA
-        clip_model.vision_model = apply_lora_to_self_attn(
-            clip_model.vision_model,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout
-        )
-        
-        return clip_model.vision_model
-
-    def features(self, data_dict: dict) -> torch.tensor:
-        feat = self.backbone(data_dict['image'])['pooler_output']
-        return feat
-
-    def classifier(self, features: torch.tensor) -> torch.tensor:
-        return self.head(features)
-
-    def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
-        pred = pred_dict['cls']
-        loss = self.loss_func(pred, label)
-
-        # Separate real/fake losses
-        mask_real = label == 0
-        mask_fake = label == 1
-
-        if mask_real.sum() > 0:
-            pred_real = pred[mask_real]
-            label_real = label[mask_real]
-            loss_real = self.loss_func(pred_real, label_real)
-        else:
-            loss_real = torch.tensor(0.0, device=pred.device)
-
-        if mask_fake.sum() > 0:
-            pred_fake = pred[mask_fake]
-            label_fake = label[mask_fake]
-            loss_fake = self.loss_func(pred_fake, label_fake)
-        else:
-            loss_fake = torch.tensor(0.0, device=pred.device)
-
-        return {
-            'overall': loss,
-            'real_loss': loss_real,
-            'fake_loss': loss_fake,
-        }
-
-    def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
-        pred = pred_dict['cls']
-        auc, eer, acc, ap = calculate_metrics_for_train(label.detach(), pred.detach())
-        return {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
-
-    def forward(self, data_dict: dict, inference=False) -> dict:
-        features = self.features(data_dict)
-        pred = self.classifier(features)
-        prob = torch.softmax(pred, dim=1)[:, 1]
-        return {'cls': pred, 'prob': prob, 'feat': features}
-
-
-# =============================================================================
-# Custom Modules
-# =============================================================================
+# Custom module to represent the residual using SVD components
 class SVDResidualLinear(nn.Module):
-    """Original Effort: SVD with trainable residual components"""
     def __init__(self, in_features, out_features, r, bias=True, init_weight=None):
         super(SVDResidualLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.r = r
+        self.r = r  # Number of top singular values to exclude
 
-        # Original weights (fixed - principal components)
+        # Original weights (fixed)
         self.weight_main = nn.Parameter(torch.Tensor(out_features, in_features), requires_grad=False)
         if init_weight is not None:
             self.weight_main.data.copy_(init_weight)
@@ -332,223 +326,103 @@ class SVDResidualLinear(nn.Module):
             self.register_parameter('bias', None)
     
     def compute_current_weight(self):
-        if hasattr(self, 'S_residual') and self.S_residual is not None:
+        if self.S_residual is not None:
             return self.weight_main + self.U_residual @ torch.diag(self.S_residual) @ self.V_residual
         else:
             return self.weight_main
 
     def forward(self, x):
-        if hasattr(self, 'S_residual') and hasattr(self, 'V_residual') and self.S_residual is not None:
+        if hasattr(self, 'U_residual') and hasattr(self, 'V_residual') and self.S_residual is not None:
+            # Reconstruct the residual weight
             residual_weight = self.U_residual @ torch.diag(self.S_residual) @ self.V_residual
+            # Total weight is the fixed main weight plus the residual
             weight = self.weight_main + residual_weight
         else:
+            # If residual components are not set, use only the main weight
             weight = self.weight_main
 
         return F.linear(x, weight, self.bias)
     
     def compute_orthogonal_loss(self):
-        if hasattr(self, 'S_residual') and self.S_residual is not None:
-        
-            U_hat = torch.cat((self.U_r, self.U_residual), dim=1) 
-            V_hat = torch.cat((self.V_r, self.V_residual), dim=0) 
-        
-            UUT = torch.mm(U_hat.t(), U_hat)
-            VVT = torch.mm(V_hat.t(), V_hat)
-        
-            I_U = torch.eye(UUT.size(0), device=UUT.device)
-            I_V = torch.eye(VVT.size(0), device=VVT.device)
-        
-            loss_orth = torch.norm(UUT - I_U, p='fro')**2 + torch.norm(VVT - I_V, p='fro')**2
+        if self.S_residual is not None:
+            # According to the properties of orthogonal matrices: A^TA = I
+            UUT = torch.cat((self.U_r, self.U_residual), dim=1) @ torch.cat((self.U_r, self.U_residual), dim=1).t()
+            VVT = torch.cat((self.V_r, self.V_residual), dim=0) @ torch.cat((self.V_r, self.V_residual), dim=0).t()
+            # print(self.U_r.size(), self.U_residual.size())  # torch.Size([1024, 1023]) torch.Size([1024, 1])
+            # print(self.V_r.size(), self.V_residual.size())  # torch.Size([1023, 1024]) torch.Size([1, 1024])
+            # UUT = self.U_residual @ self.U_residual.t()
+            # VVT = self.V_residual @ self.V_residual.t()
+            
+            # Construct an identity matrix
+            UUT_identity = torch.eye(UUT.size(0), device=UUT.device)
+            VVT_identity = torch.eye(VVT.size(0), device=VVT.device)
+            
+            # Using frobenius norm to compute loss
+            loss = 0.5 * torch.norm(UUT - UUT_identity, p='fro') + 0.5 * torch.norm(VVT - VVT_identity, p='fro')
         else:
-            loss_orth = 0.0
-        return loss_orth
+            loss = 0.0
+            
+        return loss
 
     def compute_keepsv_loss(self):
-        if hasattr(self, 'weight_original_fnorm') and self.weight_original_fnorm is not None:
+        if (self.S_residual is not None) and (self.weight_original_fnorm is not None):
+            # Total current weight is the fixed main weight plus the residual
+            weight_current = self.weight_main + self.U_residual @ torch.diag(self.S_residual) @ self.V_residual
+            # Frobenius norm of current weight
+            weight_current_fnorm = torch.norm(weight_current, p='fro')
+            
+            loss = torch.abs(weight_current_fnorm ** 2 - self.weight_original_fnorm ** 2)
+            # loss = torch.abs(weight_current_fnorm ** 2 + 0.01 * self.weight_main_fnorm ** 2 - 1.01 * self.weight_original_fnorm ** 2)
+        else:
+            loss = 0.0
         
-            current_weight = self.compute_current_weight()
-            current_fnorm_sq = torch.norm(current_weight, p='fro')**2
-            original_fnorm_sq = self.weight_original_fnorm**2
-            loss_ksv = torch.abs(current_fnorm_sq - original_fnorm_sq)
+        return loss
+    
+    def compute_fn_loss(self):
+        if (self.S_residual is not None):
+            weight_current = self.weight_main + self.U_residual @ torch.diag(self.S_residual) @ self.V_residual
+            weight_current_fnorm = torch.norm(weight_current, p='fro')
+            
+            loss = weight_current_fnorm ** 2
         else:
-            loss_ksv = 0.0
-        return loss_ksv
-
-
-class SVDLoRALinear(nn.Module):
-    """Method 2: SVD initialization + LoRA (residual set to 0)"""
-    def __init__(self, in_features, out_features, r, lora_rank=4, lora_alpha=12, lora_dropout=0.1, bias=True, init_weight=None):
-        super(SVDLoRALinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.r = r
-        self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha
-        self.scaling = lora_alpha / lora_rank
-
-        # Principal components only (fixed, residual dropped)
-        self.weight_main = nn.Parameter(torch.Tensor(out_features, in_features), requires_grad=False)
-        if init_weight is not None:
-            self.weight_main.data.copy_(init_weight)
-        else:
-            nn.init.kaiming_uniform_(self.weight_main, a=math.sqrt(5))
-
-        # LoRA parameters (trainable)
-        if lora_rank > 0:
-            self.lora_A = nn.Parameter(torch.randn(lora_rank, in_features) * 0.01)
-            self.lora_B = nn.Parameter(torch.zeros(out_features, lora_rank))
-            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-        # LoRA dropout
-        self.lora_dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0.0 else nn.Identity()
-
-        # Bias
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_features))
-            nn.init.zeros_(self.bias)
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, x):
-        # Start with frozen principal components
-        weight = self.weight_main
+            loss = 0.0
         
-        # Add LoRA adaptation
-        if self.lora_rank > 0:
-            lora_weight = self.lora_B @ self.lora_A
-            weight = weight + self.scaling * lora_weight
+        return loss
 
-        return F.linear(x, weight, self.bias)
-
-
-class LoRALinear(nn.Module):
-    """Method 3: Pure LoRA on frozen original weights"""
-    def __init__(self, in_features, out_features, lora_rank=4, lora_alpha=12, lora_dropout=0.1, bias=True, init_weight=None):
-        super(LoRALinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha
-        self.scaling = lora_alpha / lora_rank
-
-        # Original weights (frozen)
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features), requires_grad=False)
-        if init_weight is not None:
-            self.weight.data.copy_(init_weight)
-        else:
-            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-
-        # LoRA parameters (trainable)
-        if lora_rank > 0:
-            self.lora_A = nn.Parameter(torch.randn(lora_rank, in_features) * 0.01)
-            self.lora_B = nn.Parameter(torch.zeros(out_features, lora_rank))
-            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-        # LoRA dropout
-        self.lora_dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0.0 else nn.Identity()
-
-        # Bias
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_features))
-            nn.init.zeros_(self.bias)
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, x):
-        # Start with frozen base weight
-        weight = self.weight
-        
-        # Add LoRA adaptation
-        if self.lora_rank > 0:
-            lora_weight = self.lora_B @ self.lora_A
-            weight = weight + self.scaling * lora_weight
-
-        return F.linear(x, weight, self.bias)
-
-
-# =============================================================================
-# Functions to replace nn.Linear in the model
-# =============================================================================
-
+# Function to replace nn.Linear modules within self_attn modules with SVDResidualLinear
 def apply_svd_residual_to_self_attn(model, r):
     for name, module in model.named_children():
         if 'self_attn' in name:
+            # Replace nn.Linear layers in this module
             for sub_name, sub_module in module.named_modules():
                 if isinstance(sub_module, nn.Linear):
+                    # Get parent module within self_attn
                     parent_module = module
                     sub_module_names = sub_name.split('.')
                     for module_name in sub_module_names[:-1]:
                         parent_module = getattr(parent_module, module_name)
+                    # Replace the nn.Linear layer with SVDResidualLinear
                     setattr(parent_module, sub_module_names[-1], replace_with_svd_residual(sub_module, r))
         else:
+            # Recursively apply to child modules
             apply_svd_residual_to_self_attn(module, r)
-    
+    # After replacing, set requires_grad for residual components
     for param_name, param in model.named_parameters():
         if any(x in param_name for x in ['S_residual', 'U_residual', 'V_residual']):
             param.requires_grad = True
         else:
-            param.requires_grad = False 
-    return model
-
-def apply_svd_lora_to_self_attn(model, r, lora_rank=4, lora_alpha=12, lora_dropout=0.1):
-    """Replace nn.Linear with SVDLoRALinear in self_attn modules"""
-    for name, module in model.named_children():
-        if 'self_attn' in name:
-            for sub_name, sub_module in module.named_modules():
-                if isinstance(sub_module, nn.Linear):
-                    parent_module = module
-                    sub_module_names = sub_name.split('.')
-                    for module_name in sub_module_names[:-1]:
-                        parent_module = getattr(parent_module, module_name)
-                    setattr(parent_module, sub_module_names[-1], 
-                           replace_with_svd_lora(sub_module, r, lora_rank, lora_alpha, lora_dropout))
-        else:
-            apply_svd_lora_to_self_attn(module, r, lora_rank, lora_alpha, lora_dropout)
-    
-    # Set requires_grad
-    for param_name, param in model.named_parameters():
-        if any(x in param_name for x in ['lora_A', 'lora_B', 'bias']):
-            param.requires_grad = True
-        else:
             param.requires_grad = False
     return model
 
 
-def apply_lora_to_self_attn(model, lora_rank=4, lora_alpha=12, lora_dropout=0.1):
-    """Replace nn.Linear with LoRALinear in self_attn modules"""
-    for name, module in model.named_children():
-        if 'self_attn' in name:
-            for sub_name, sub_module in module.named_modules():
-                if isinstance(sub_module, nn.Linear):
-                    parent_module = module
-                    sub_module_names = sub_name.split('.')
-                    for module_name in sub_module_names[:-1]:
-                        parent_module = getattr(parent_module, module_name)
-                    setattr(parent_module, sub_module_names[-1], 
-                           replace_with_lora(sub_module, lora_rank, lora_alpha, lora_dropout))
-        else:
-            apply_lora_to_self_attn(module, lora_rank, lora_alpha, lora_dropout)
-    
-    # Set requires_grad
-    for param_name, param in model.named_parameters():
-        if any(x in param_name for x in ['lora_A', 'lora_B', 'bias']):
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-    return model
-
-
-# =============================================================================
-# Replacement functions
-# =============================================================================
-
+# Function to replace a module with SVDResidualLinear
 def replace_with_svd_residual(module, r):
-    """Replace nn.Linear with SVDResidualLinear"""
     if isinstance(module, nn.Linear):
         in_features = module.in_features
         out_features = module.out_features
         bias = module.bias is not None
 
+        # Create SVDResidualLinear module
         new_module = SVDResidualLinear(in_features, out_features, r, bias=bias, init_weight=module.weight.data.clone())
 
         if bias and module.bias is not None:
@@ -556,21 +430,30 @@ def replace_with_svd_residual(module, r):
 
         new_module.weight_original_fnorm = torch.norm(module.weight.data, p='fro')
 
-        # Perform SVD
+        # Perform SVD on the original weight
         U, S, Vh = torch.linalg.svd(module.weight.data, full_matrices=False)
-        r = min(r, len(S))
 
-        # Principal components (fixed)
-        U_r = U[:, :r]
-        S_r = S[:r]
-        Vh_r = Vh[:r, :]
+        # Determine r based on the rank of the weight matrix
+        r = min(r, len(S))  # Ensure r does not exceed the number of singular values
+
+        # Keep top r singular components (main weight)
+        U_r = U[:, :r]      # Shape: (out_features, r)
+        S_r = S[:r]         # Shape: (r,)
+        Vh_r = Vh[:r, :]    # Shape: (r, in_features)
+
+        # Reconstruct the main weight (fixed)
         weight_main = U_r @ torch.diag(S_r) @ Vh_r
+
+        # Calculate the frobenius norm of main weight
+        new_module.weight_main_fnorm = torch.norm(weight_main.data, p='fro')
+
+        # Set the main weight
         new_module.weight_main.data.copy_(weight_main)
 
         # Residual components (trainable)
-        U_residual = U[:, r:]
-        S_residual = S[r:]
-        Vh_residual = Vh[r:, :]
+        U_residual = U[:, r:]    # Shape: (out_features, n - r)
+        S_residual = S[r:]       # Shape: (n - r,)
+        Vh_residual = Vh[r:, :]  # Shape: (n - r, in_features)
 
         if len(S_residual) > 0:
             new_module.S_residual = nn.Parameter(S_residual.clone())
@@ -584,60 +467,11 @@ def replace_with_svd_residual(module, r):
             new_module.S_residual = None
             new_module.U_residual = None
             new_module.V_residual = None
+            
             new_module.S_r = None
             new_module.U_r = None
             new_module.V_r = None
 
         return new_module
-    return module
-
-
-def replace_with_svd_lora(module, r, lora_rank=4, lora_alpha=12, lora_dropout=0.1):
-    """Replace nn.Linear with SVDLoRALinear"""
-    if isinstance(module, nn.Linear):
-        in_features = module.in_features
-        out_features = module.out_features
-        bias = module.bias is not None
-
-        new_module = SVDLoRALinear(
-            in_features, out_features, r, 
-            lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-            bias=bias, init_weight=module.weight.data.clone()
-        )
-
-        if bias and module.bias is not None:
-            new_module.bias.data.copy_(module.bias.data)
-
-        # Perform SVD to get principal components only (residual set to 0)
-        U, S, Vh = torch.linalg.svd(module.weight.data, full_matrices=False)
-        r = min(r, len(S))
-
-        # Principal components (fixed)
-        U_r = U[:, :r]
-        S_r = S[:r]
-        Vh_r = Vh[:r, :]
-        weight_main = U_r @ torch.diag(S_r) @ Vh_r
-        new_module.weight_main.data.copy_(weight_main)
-
-        return new_module
-    return module
-
-
-def replace_with_lora(module, lora_rank=4, lora_alpha=12, lora_dropout=0.1):
-    """Replace nn.Linear with LoRALinear"""
-    if isinstance(module, nn.Linear):
-        in_features = module.in_features
-        out_features = module.out_features
-        bias = module.bias is not None
-
-        new_module = LoRALinear(
-            in_features, out_features,
-            lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-            bias=bias, init_weight=module.weight.data.clone()
-        )
-
-        if bias and module.bias is not None:
-            new_module.bias.data.copy_(module.bias.data)
-
-        return new_module
-    return module
+    else:
+        return module
