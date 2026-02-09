@@ -1,5 +1,14 @@
+from math import dist
 import os
 import logging
+
+class RankFilter(logging.Filter):
+    def __init__(self, rank):
+        super().__init__()
+        self.rank = rank
+
+    def filter(self, record):
+        return dist.get_rank() == self.rank
 
 def create_logger(log_path):
     # Create log path
@@ -25,11 +34,3 @@ def create_logger(log_path):
     logger.addHandler(sh)
 
     return logger
-
-class RankFilter(logging.Filter):
-    def __init__(self, rank):
-        super().__init__()
-        self.rank = rank
-
-    def filter(self, record):
-        return dist.get_rank() == self.rank
