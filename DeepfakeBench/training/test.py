@@ -234,8 +234,7 @@ def main():
             new_weights[new_key] = value
 
 
-        # model.load_state_dict(new_weights, strict=False)
-        model.load_state_dict(new_weights)
+        model.load_state_dict(new_weights, strict=True)
         print('===> Load checkpoint done!')
     else:
         print('Fail to load the pre-trained weights')
