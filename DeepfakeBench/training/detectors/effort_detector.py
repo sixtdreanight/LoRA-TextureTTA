@@ -27,28 +27,23 @@ from transformers import AutoProcessor, CLIPModel, ViTModel, ViTConfig
 logger = logging.getLogger(__name__)
 
 class Linear(nn.Module):
-    def __init__(self,in_features,out_features,r=0,lora_alpha=1,merge_weight=False,bias=True):
-        super(Linear,self).__init__()
+    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0, merge_weights=True, bias=True):
+        super(Linear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
         self.lora_alpha = lora_alpha
-        self.merge_weight = merge_weight
+        self.merge_weights = merge_weights
         self.merged = False
         
-        self.weight = nn.Parameter(torch.Tensor(out_features,in_features))
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_features))
-        else:
-            self.register_Parameter('bias',None)
+        self.lora_dropout = nn.Dropout(p=lora_dropout)
+        
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.bias = nn.Parameter(torch.Tensor(out_features))
             
-        if r > 0:
-            self.lora_A = nn.Parameter(torch.Tensor(in_features,r))
-            self.lora_B = nn.Parameter(torch.Tensor(r,out_features))
-            self.scaling = lora_alpha / r
-        else:
-            self.register('lora_A',None)
-            self.register('lora_B',None)
+        self.lora_A = nn.Parameter(torch.Tensor(in_features, r))
+        self.lora_B = nn.Parameter(torch.Tensor(r, out_features))
+        self.scaling = lora_alpha / r
         
         self.reset_parameters()
         
@@ -67,26 +62,26 @@ class Linear(nn.Module):
             nn.init.normal_(self.lora_A, mean=0, std=0.02)
             nn.init.zeros_(self.lora_B)    
     
-    def forward(self,x):
-        original = F.linear(x,self.weight,self.bias)
+    def forward(self, x):
+        original = F.linear(x, self.weight, self.bias)
         
         if self.r > 0 and not self.merged:
-            lora_output = (x @ self.lora_A @ self.lora_B) * self.scaling
+            lora_x = self.lora_dropout(x)
+            lora_output = (lora_x @ self.lora_A @ self.lora_B) * self.scaling
             return original + lora_output
         
         return original
     
-    def train(self,mode=True):
-        if self.merge_weight:
+    def train(self, mode=True):
+        if self.merge_weights:
             if mode:
                 if self.merged:
                     self._unmerge_weights()
-            
             else:
                 if not self.merged:
                     self._merge_weights()
         
-        return super(Linear,self).train(mode) 
+        return super(Linear, self).train(mode) 
     
     def _merge_weights(self):
         if self.r > 0 and not self.merged:
@@ -103,22 +98,6 @@ class Linear(nn.Module):
 class LoRAModule:
     Linear = Linear
     
-    @staticmethod
-    def mark_only_lora_as_trainable(module):
-        for name, param in module.named_parameters():
-            if 'lora_' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-                
-    @staticmethod
-    def lora_state_dict(module):
-        state_dict = {}
-        for name, param in module.named_parameters():
-            if 'lora_' in name:
-                state_dict[name] = param.data.clone()
-        return state_dict
-    
 lora = LoRAModule()
         
         
@@ -128,13 +107,13 @@ class EffortDetector(nn.Module):
         super(EffortDetector, self).__init__()
         self.config = config
         self.backbone = self.build_backbone(config)
-        #self.head = nn.Linear(1024, 2)
         self.head = lora.Linear(
             in_features=1024,
             out_features=2,
             r=2,
             lora_alpha=8,
-            merge_weight=False,
+            lora_dropout=0,
+            merge_weights=False,
             bias=True
         )
         self.loss_func = nn.CrossEntropyLoss()
@@ -149,23 +128,18 @@ class EffortDetector(nn.Module):
         # std: [0.26862954, 0.26130258, 0.27577711]
         
         # ViT-L/14 224*224
-        clip_model = CLIPModel.from_pretrained("/home/user1/effort/effort_main/Effort-AIGI-Detection-main/DeepfakeBench/training/models--openai--clip-vit-large-patch14")  # the path of this folder in your disk (download from the above link)
-
+        clip_model = CLIPModel.from_pretrained("/home/user1/effort/effort_main/Effort-AIGI-Detection-main/DeepfakeBench/training/models--openai--clip-vit-large-patch14")
 
         # ViT-L/14 224*224: 1024-1
         # clip_model.vision_model = apply_svd_residual_to_self_attn(clip_model.vision_model, r=1024-1)
 
-
         for param in clip_model.vision_model.parameters():
             param.requires_grad = False
 
-   
         target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
         
         for name, module in clip_model.vision_model.named_modules():
-
             if any(target in name for target in target_modules) and isinstance(module, nn.Linear):
-     
                 parent_name = ".".join(name.split(".")[:-1])
                 child_name = name.split(".")[-1]
                 parent = clip_model.vision_model
@@ -176,9 +150,9 @@ class EffortDetector(nn.Module):
                 lora_layer = lora.Linear(
                     module.in_features, 
                     module.out_features, 
-                    r=4,  # LoRA rank
-                    lora_alpha=16,  # LoRA alpha
-                    merge_weight=False
+                    r=4,
+                    lora_alpha=16,
+                    merge_weights=False
                 )
       
                 lora_layer.weight.data.copy_(module.weight.data)
@@ -199,7 +173,7 @@ class EffortDetector(nn.Module):
 
     def classifier(self, features: torch.tensor) -> torch.tensor:
         return self.head(features)
-
+    
     #def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
     #    label = data_dict['label']
     #    pred = pred_dict['cls']
