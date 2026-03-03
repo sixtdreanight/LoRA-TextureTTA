@@ -87,3 +87,5 @@ cuda: true   # whether to use CUDA acceleration
 cudnn: true   # whether to use CuDNN for convolution operations
 
 save_avg: true
+
+use_loralib: false
