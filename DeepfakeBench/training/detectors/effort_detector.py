@@ -33,7 +33,6 @@ class Linear(nn.Module):
         self.out_features = out_features
         self.r = r
         self.lora_alpha = lora_alpha
-        self.merged = False
         
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         
@@ -64,7 +63,7 @@ class Linear(nn.Module):
     def forward(self, x):
         original = F.linear(x, self.weight, self.bias)
         
-        if self.r > 0 and not self.merged:
+        if self.r > 0:
             lora_x = self.lora_dropout(x)
             lora_output = (lora_x @ self.lora_A @ self.lora_B) * self.scaling
             return original + lora_output
