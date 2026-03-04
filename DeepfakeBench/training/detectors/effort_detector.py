@@ -27,12 +27,13 @@ from transformers import AutoProcessor, CLIPModel, ViTModel, ViTConfig
 logger = logging.getLogger(__name__)
 
 class Linear(nn.Module):
-    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0, bias=True):
+    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0, merge_weights=False, bias=True):
         super(Linear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
         self.lora_alpha = lora_alpha
+        self.merge_weights = merge_weights
         
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         
@@ -63,7 +64,7 @@ class Linear(nn.Module):
     def forward(self, x):
         original = F.linear(x, self.weight, self.bias)
         
-        if self.r > 0:
+        if self.r > 0 and not self.merge_weights:
             lora_x = self.lora_dropout(x)
             lora_output = (lora_x @ self.lora_A @ self.lora_B) * self.scaling
             return original + lora_output
@@ -97,6 +98,7 @@ class EffortDetector(nn.Module):
             r=2,
             lora_alpha=8,
             lora_dropout=0,
+            merge_weights=False,
             bias=True
         )
         self.loss_func = nn.CrossEntropyLoss()
@@ -135,6 +137,8 @@ class EffortDetector(nn.Module):
                     module.out_features, 
                     r=4,
                     lora_alpha=16,
+                    lora_dropout=0,
+                    merge_weights=False
                 )
       
                 lora_layer.weight.data.copy_(module.weight.data)
