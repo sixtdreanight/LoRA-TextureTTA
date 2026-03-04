@@ -140,57 +140,51 @@ def test_epoch(model, test_data_loaders):
 @torch.no_grad()
 def inference(model, data_dict):
     """
-    测试时进行TAA
+    TAA 推理：
     """
+    # 获取原始数据
+    images = data_dict['image'] 
+    true_label = data_dict['label'] 
     
-    images = data_dict['image']
     h, w = images.shape[2], images.shape[3]
     
-    crop_h, crop_w = int(h * 0.9), int(w * 0.9)
+    crop_radio = 0.8
+    crop_h, crop_w = int(h * crop_radio), int(w * crop_radio)
+    num_crop = 5
+
+    crop_probs = []
+    crop_feats = []
     
-    #中心位置
-    y1 = (h - crop_h) // 2
-    y2 = y1 + crop_h
-    x1 = (w - crop_w) // 2
-    x2 = x1 + crop_w
+    # 对每一张图片的每一个切片进行预测
+    for i in range(num_crop):
+       
+        y1 = random.randint(0, h - crop_h)
+        y2 = y1 + crop_h
+        x1 = random.randint(0, w - crop_w)
+        x2 = x1 + crop_w
+        
+        crop_img = images[:, :, y1:y2, x1:x2]
+        crop_img_resized = F.interpolate(
+            crop_img, size=(h, w), mode='bilinear', align_corners=False
+        )
+
+        temp_dict = data_dict.copy()
+        temp_dict['image'] = crop_img_resized
+        prediction = model(temp_dict, inference=True)
+        
+        prob = prediction['prob']
+        crop_probs.append(prob)
+        crop_feats.append(prediction['feat'])
+        
+
+    final_prob = torch.stack(crop_probs).mean(0)
+    final_feat = torch.stack(crop_feats).mean(0)
     
-    #角落切片
-    crops = [
-        images,
-        F.interpolate(images[:, :, 0:crop_h, 0:crop_w], size=(h, w), mode='bilinear'), # 左上
-        F.interpolate(images[:, :, 0:crop_h, w-crop_w:w], size=(h, w), mode='bilinear'), # 右上
-        F.interpolate(images[:, :, h-crop_h:h, 0:crop_w], size=(h, w), mode='bilinear'), # 左下
-        F.interpolate(images[:, :, h-crop_h:h, w-crop_w:w], size=(h, w), mode='bilinear'), # 右下
-        F.interpolate(images[:, :, y1:y2, x1:x2], size=(h, w), mode='bilinear'), #中间
-    ]
-    
-    sum_probs = None
-    sum_feats = None
-    
-    for i, crop_img in enumerate(crops):
-        for j in range(0,3):
-            temp_dict = data_dict.copy()
-            temp_dict['image'] = crop_img
-        
-            predictions = model(temp_dict, inference=True)
-        
-            prob = predictions['prob']
-            feat = predictions['feat']
-        
-            if sum_probs is None:
-                sum_probs = prob
-                sum_feats = feat
-            else:
-                sum_probs += prob
-                sum_feats += feat
-        
-    num = len(crops)
-    final_pre = {
-        'prob': sum_probs / num,
-        'feat': sum_feats / num
+    return {
+        'prob': final_prob,
+        'feat': final_feat
     }
     
-    return final_pre
         
     # predictions = model(data_dict, inference=True)
     # return predictions
