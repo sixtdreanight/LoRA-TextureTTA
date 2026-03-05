@@ -104,6 +104,9 @@ class EffortDetector(nn.Module):
         self.loss_func = nn.CrossEntropyLoss()
         self.prob, self.label = [], []
         self.correct, self.total = 0, 0
+        
+        # --- 新增：自适应阈值队列 ---
+        self.prediction_queue = []
 
     def build_backbone(self, config):
         # ⚠⚠⚠ Download CLIP model using the below link
@@ -153,6 +156,34 @@ class EffortDetector(nn.Module):
         
         return clip_model.vision_model
 
+    # --- 新增：OWTTT 动态阈值计算方法 ---
+    def compute_adaptive_threshold(self, gap_weight=0.01, max_len=512):
+        if len(self.prediction_queue) < 32:
+            return 0.5
+        
+        os = np.array(self.prediction_queue[-max_len:], dtype=float)
+        threshold_range = np.arange(0.1, 0.9, 0.01)
+        best_th = 0.5
+        min_crit = float('inf')
+        
+        for th in threshold_range:
+            mask = os >= th
+            nb = os.size
+            nb1 = np.count_nonzero(mask)
+            w1 = nb1 / nb
+            w0 = 1 - w1
+            if w1 == 0 or w0 == 0: continue
+            
+            v0 = np.var(os[~mask])
+            v1 = np.var(os[mask])
+            min_gap = np.min(np.abs(os - th))
+            
+            crit = w0 * v0 + w1 * v1 - gap_weight * min_gap
+            if crit < min_crit:
+                min_crit = crit
+                best_th = th
+        return best_th
+
     def features(self, data_dict: dict) -> torch.tensor:
         feat = self.backbone(data_dict['image'])['pooler_output']
         return feat
@@ -192,8 +223,23 @@ class EffortDetector(nn.Module):
 
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
         label = data_dict['label']
-        pred = pred_dict['cls']
-        auc, eer, acc, ap = calculate_metrics_for_train(label.detach(), pred.detach())
+        prob = pred_dict['prob']
+        
+        # 更新队列
+        self.prediction_queue.extend(prob.detach().cpu().numpy().tolist())
+        if len(self.prediction_queue) > 1000:
+            self.prediction_queue = self.prediction_queue[-1000:]
+            
+        # 计算当前最优阈值
+        current_th = self.compute_adaptive_threshold()
+        
+        # 使用动态阈值判定标签并计算 Acc
+        pred_label = (prob > current_th).long()
+        correct = (pred_label == label.detach()).sum().item()
+        acc = correct / len(label)
+        
+        # 其他指标保持原样
+        auc, eer, _, ap = calculate_metrics_for_train(label.detach(), pred_dict['cls'].detach())
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
         return metric_batch_dict
 
