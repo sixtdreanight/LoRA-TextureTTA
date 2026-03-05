@@ -122,12 +122,24 @@ def test_epoch(model, test_data_loaders):
     keys = test_data_loaders.keys()
     for key in keys:
         data_dict = test_data_loaders[key].dataset.data_dict
-        # compute loss for each dataset
-        predictions_nps, label_nps,feat_nps = test_one_dataset(model, test_data_loaders[key])
+        # 这里的 predictions_nps 是概率数组 [N]
+        predictions_nps, label_nps, feat_nps = test_one_dataset(model, test_data_loaders[key])
+
+        # 【核心修改点】：获取模型在跑完该数据集后最终稳定的动态阈值
+        global prediction_queue
+        final_adaptive_th = calculate_adaptive_threshold(prediction_queue)
+        tqdm.write(f"Using Adaptive Threshold: {final_adaptive_th:.4f}")
+
+        pred_labels = (predictions_nps > final_adaptive_th).astype(int)
+        correct_acc = (pred_labels == label_nps).mean()
 
         # compute metric for each dataset
         metric_one_dataset = get_test_metrics(y_pred=predictions_nps, y_true=label_nps,
                                               img_names=data_dict['image'])
+        
+        metric_one_dataset['acc'] = correct_acc
+        metric_one_dataset['best_th'] = final_adaptive_th 
+        
         metrics_all_datasets[key] = metric_one_dataset
 
         # info for each dataset
@@ -136,6 +148,37 @@ def test_epoch(model, test_data_loaders):
             tqdm.write(f"{k}: {v}")
 
     return metrics_all_datasets
+
+
+prediction_queue = []
+MAX_QUEUE_SIZE = 500
+
+def calculate_adaptive_threshold(scores):
+    """
+    最小化内方差确定阈值
+    """
+    if len(scores) < 10:
+        return 0.5
+    
+    scores = np.array(scores)
+    thresholds = np.linspace(np.min(scores), np.max(scores), num=50)
+    min_variance = float('inf')
+    best_lambda = 0.5
+    
+    for lmbda in thresholds:
+        id_group = scores[scores > lmbda]
+        ood_group = scores[scores <= lmbda]
+        
+        if len(id_group) == 0 or len(ood_group) == 0:
+            continue
+        
+        intra_var = np.var(id_group) + np.var(ood_group)
+        
+        if intra_var < min_variance:
+            min_variance = intra_var
+            best_lambda = lmbda
+            
+    return best_lambda
 
 @torch.no_grad()
 def inference(model, data_dict):
@@ -171,18 +214,32 @@ def inference(model, data_dict):
         temp_dict = data_dict.copy()
         temp_dict['image'] = crop_img_resized
         prediction = model(temp_dict, inference=True)
-        
-        prob = prediction['prob']
-        crop_probs.append(prob)
+       
+        crop_probs.append(prediction['prob'])
         crop_feats.append(prediction['feat'])
-        
-
-    final_prob = torch.stack(crop_probs).mean(0)
-    final_feat = torch.stack(crop_feats).mean(0)
+          
+    stack_probs = torch.stack(crop_probs)
+    stack_feats = torch.stack(crop_feats)
+    
+    confidence_scores = torch.abs(stack_probs - 0.5)
+    
+    max_conf_indices = torch.argmax(confidence_scores, dim=0)
+    
+    batch_size = images.shape[0]
+    final_prob = stack_probs[max_conf_indices, torch.arange(batch_size)]
+    final_feat = stack_feats[max_conf_indices, torch.arange(batch_size), :]
+    
+    global prediction_queue
+    prediction_queue.extend(final_prob.detach().cpu().numpy().tolist())
+    if len(prediction_queue) > MAX_QUEUE_SIZE:
+        prediction_queue = prediction_queue[-MAX_QUEUE_SIZE:]
+    
+    current_lambda = calculate_adaptive_threshold(prediction_queue)
     
     return {
         'prob': final_prob,
-        'feat': final_feat
+        'feat': final_feat,
+        'adaptive_threshold': current_lambda
     }
     
         
