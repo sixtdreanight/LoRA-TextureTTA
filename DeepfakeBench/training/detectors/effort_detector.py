@@ -243,9 +243,42 @@ class EffortDetector(nn.Module):
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
         return metric_batch_dict
 
+    # def forward(self, data_dict: dict, inference=False) -> dict:
+    #     features = self.features(data_dict)
+    #     pred = self.classifier(features)
+    #     prob = torch.softmax(pred, dim=1)[:, 1]
+    #     pred_dict = {'cls': pred, 'prob': prob, 'feat': features}
+    #     return pred_dict
+    
     def forward(self, data_dict: dict, inference=False) -> dict:
+        images = data_dict['image']
+        
+        # 兼容性处理：如果是测试模式且输入是 5 维 (Batch, Crops, C, H, W)
+        if inference and len(images.shape) == 5:
+            b, n, c, h, w = images.shape
+            # 将 Batch 和 Crops 维度合并进行特征提取
+            flat_images = images.view(-1, c, h, w)
+            feats = self.backbone(flat_images)['pooler_output'] # [B*5, 1024]
+            preds = self.classifier(feats) # [B*5, 2]
+            probs = torch.softmax(preds, dim=1)[:, 1] # [B*5]
+        
+            # 恢复成 [B, 5] 进行置信度选择 (TAA 逻辑)
+            probs = probs.view(b, n)
+            feats = feats.view(b, n, -1)
+        
+            # 寻找偏离 0.5 最近/最远的作为最终预测（原 TAA 逻辑）
+            conf = torch.abs(probs - 0.5)
+            max_idx = torch.argmax(conf, dim=1)
+        
+            final_prob = probs[torch.arange(b), max_idx]
+            final_feat = feats[torch.arange(b), max_idx, :]
+            final_pred = preds.view(b, n, -1)[torch.arange(b), max_idx, :]
+        
+            return {'cls': final_pred, 'prob': final_prob, 'feat': final_feat}
+    
+        # 原有的正常训练/推理流程
         features = self.features(data_dict)
         pred = self.classifier(features)
         prob = torch.softmax(pred, dim=1)[:, 1]
-        pred_dict = {'cls': pred, 'prob': prob, 'feat': features}
-        return pred_dict
+        return {'cls': pred, 'prob': prob, 'feat': features}
+            
