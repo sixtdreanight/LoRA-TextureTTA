@@ -53,7 +53,7 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
     """
     Abstract base class for all deepfake datasets.
     """
-    def __init__(self, config=None, mode='train'):
+    def __init__(self, config=None, mode='train', multi_crop=False):
         """Initializes the dataset object.
 
         Args:
@@ -67,6 +67,9 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         # Set the configuration and mode
         self.config = config
         self.mode = mode
+        
+        self.multi_crop = multi_crop
+        
         self.compression = config['compression']
         self.frame_num = config['frame_num'][mode]
 
@@ -533,14 +536,30 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
 
 
             # To tensor and normalize
-            if not no_norm:
-                image_trans = self.normalize(self.to_tensor(image_trans))
-                #if self.mode == 'train' and self.config['with_landmark']:
-                #    landmarks_trans = torch.from_numpy(landmarks_trans)
-                #if self.mode == 'train' and self.config['with_mask']:
-                #    mask_trans = torch.from_numpy(mask_trans)
-
-            image_tensors.append(image_trans)
+            if self.multi_crop and self.mode=='test':
+                h, w = image_trans.shape[:2]
+                crop_radio = 0.8
+                crop_h, crop_w = int(h*crop_radio), int(w*crop_radio)
+                crops = []
+                
+                for _ in range(5):
+                    y1 = random.randint(0, h - crop_h)
+                    x1 = random.randint(0, w - crop_w)
+                    crop_img = image_trans[y1:y1+crop_h, x1:x1+crop_w]
+                    crop_img = cv2.resize(crop_img, (self.config['resolution'], self.config['resolution']))
+                    
+                    t_crop = self.to_tensor(crop_img)
+                    if not no_norm:
+                        t_crop = self.normalize(t_crop)
+                    crops.append(t_crop)
+                    
+                current_image_tensor = torch.stack(crops, dim=0)
+            else:
+                current_image_tensor = self.to_tensor(image_trans)
+                if not no_norm:
+                    current_image_tensor = self.normalize(current_image_tensor)
+                    
+            image_tensors.append(current_image_tensor)
             landmark_tensors.append(landmarks_trans)
             mask_tensors.append(mask_trans)
 
