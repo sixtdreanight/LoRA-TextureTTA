@@ -62,6 +62,7 @@ def prepare_testing_data(config):
         test_set = DeepfakeAbstractBaseDataset(
                 config=config,
                 mode='test',
+                multi_crop=True
             )
         test_data_loader = \
             torch.utils.data.DataLoader(
@@ -182,67 +183,16 @@ def calculate_adaptive_threshold(scores):
 
 @torch.no_grad()
 def inference(model, data_dict):
-    """
-    TAA 推理：
-    """
-    # 获取原始数据
-    images = data_dict['image'] 
-    true_label = data_dict['label'] 
     
-    h, w = images.shape[2], images.shape[3]
+    predictions = model(data_dict, inference=True)
     
-    crop_radio = 0.8
-    crop_h, crop_w = int(h * crop_radio), int(w * crop_radio)
-    num_crop = 5
-
-    crop_probs = []
-    crop_feats = []
-    
-    # 对每一张图片的每一个切片进行预测
-    for i in range(num_crop):
-       
-        y1 = random.randint(0, h - crop_h)
-        y2 = y1 + crop_h
-        x1 = random.randint(0, w - crop_w)
-        x2 = x1 + crop_w
-        
-        crop_img = images[:, :, y1:y2, x1:x2]
-        crop_img_resized = F.interpolate(
-            crop_img, size=(h, w), mode='bilinear', align_corners=False
-        )
-
-        temp_dict = data_dict.copy()
-        temp_dict['image'] = crop_img_resized
-        prediction = model(temp_dict, inference=True)
-       
-        crop_probs.append(prediction['prob'])
-        crop_feats.append(prediction['feat'])
-          
-    stack_probs = torch.stack(crop_probs)
-    stack_feats = torch.stack(crop_feats)
-    
-    confidence_scores = torch.abs(stack_probs - 0.5)
-    
-    max_conf_indices = torch.argmax(confidence_scores, dim=0)
-    
-    batch_size = images.shape[0]
-    final_prob = stack_probs[max_conf_indices, torch.arange(batch_size)]
-    final_feat = stack_feats[max_conf_indices, torch.arange(batch_size), :]
-    
+    # 维护动态阈值队列
     global prediction_queue
-    prediction_queue.extend(final_prob.detach().cpu().numpy().tolist())
+    prediction_queue.extend(predictions['prob'].detach().cpu().numpy().tolist())
     if len(prediction_queue) > MAX_QUEUE_SIZE:
         prediction_queue = prediction_queue[-MAX_QUEUE_SIZE:]
     
-    current_lambda = calculate_adaptive_threshold(prediction_queue)
-    
-    return {
-        'prob': final_prob,
-        'feat': final_feat,
-        'adaptive_threshold': current_lambda
-    }
-    
-        
+    return predictions       
     # predictions = model(data_dict, inference=True)
     # return predictions
 
