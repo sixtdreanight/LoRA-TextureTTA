@@ -485,6 +485,7 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         image_tensors = []
         landmark_tensors = []
         mask_tensors = []
+        texture_score_tensors = []
         augmentation_seed = None
 
         # print(image_paths)
@@ -540,34 +541,56 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             if self.multi_crop and self.mode=='test':
                 res = self.config['resolution']
                 h, w = image_trans.shape[:2]
-                crop_radio = self.config.get('crop_radio', 0.8)
-                num_crops = self.config.get('num_crops', 5)
-                crop_h, crop_w = int(h*crop_radio), int(w*crop_radio)
-                crops = []
-                texture_scores = []
-                for _ in range(num_crops):
-                    y1 = random.randint(0, h - crop_h)
-                    x1 = random.randint(0, w - crop_w)
-                    crop_img = image_trans[y1:y1+crop_h, x1:x1+crop_w]
-                    crop_img = cv2.resize(crop_img, (res, res))
-                    # compute texture richness: Var(Laplacian(gray(P)))
-                    gray = cv2.cvtColor(crop_img, cv2.COLOR_RGB2GRAY)
-                    texture_scores.append(float(np.var(cv2.Laplacian(gray, cv2.CV_64F))))
-                    t_crop = self.to_tensor(crop_img)
-                    if not no_norm:
-                        t_crop = self.normalize(t_crop)
-                    crops.append(t_crop)
-                # if use_texture_crop: keep top-Kr rich + top-Ks simple; else keep all
+                all_imgs, all_scores = [], []
+
                 if self.use_texture_crop:
+                    # ── Step 2: sliding-window patch extraction (stride = p/2) ──
+                    patch_size = self.config.get('texture_patch_size', res // 2)
+                    stride = patch_size // 2
                     Kr = self.config.get('texture_Kr', 3)
                     Ks = self.config.get('texture_Ks', 3)
-                    order = np.argsort(texture_scores)
-                    idx = list(dict.fromkeys(
-                        list(order[-(Kr):][::-1]) + list(order[:Ks])
-                    ))
-                    crops = [crops[i] for i in idx]
+                    raw_patches, raw_scores = [], []
+                    y = 0
+                    while y + patch_size <= h:
+                        x = 0
+                        while x + patch_size <= w:
+                            patch = image_trans[y:y+patch_size, x:x+patch_size]
+                            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+                            raw_scores.append(float(np.var(cv2.Laplacian(gray, cv2.CV_64F))))
+                            raw_patches.append(cv2.resize(patch, (res, res)))
+                            x += stride
+                        y += stride
+                    if len(raw_patches) == 0:          # fallback: image smaller than patch
+                        raw_patches = [cv2.resize(image_trans, (res, res))]
+                        raw_scores = [1.0]
+                    # ── Select P* = R ∪ S ──
+                    order = np.argsort(raw_scores)
+                    idx = list(dict.fromkeys(list(order[-Kr:][::-1]) + list(order[:Ks])))
+                    # ── Prepend full image as index-0 (for s_full); sentinel score = 0 ──
+                    all_imgs  = [cv2.resize(image_trans, (res, res))] + [raw_patches[i] for i in idx]
+                    all_scores = [0.0] + [raw_scores[i] for i in idx]
+                else:
+                    # ── Original random multi-crop (unchanged) ──
+                    crop_radio = self.config.get('crop_radio', 0.8)
+                    num_crops  = self.config.get('num_crops', 5)
+                    crop_h, crop_w = int(h*crop_radio), int(w*crop_radio)
+                    for _ in range(num_crops):
+                        y1 = random.randint(0, h - crop_h)
+                        x1 = random.randint(0, w - crop_w)
+                        crop_img = image_trans[y1:y1+crop_h, x1:x1+crop_w]
+                        crop_img = cv2.resize(crop_img, (res, res))
+                        gray = cv2.cvtColor(crop_img, cv2.COLOR_RGB2GRAY)
+                        all_scores.append(float(np.var(cv2.Laplacian(gray, cv2.CV_64F))))
+                        all_imgs.append(crop_img)
 
+                crops = []
+                for img in all_imgs:
+                    t = self.to_tensor(img)
+                    if not no_norm:
+                        t = self.normalize(t)
+                    crops.append(t)
                 current_image_tensor = torch.stack(crops, dim=0)
+                current_texture_score_tensor = torch.tensor(all_scores, dtype=torch.float32)
             else:
                 current_image_tensor = self.to_tensor(image_trans)
                 if not no_norm:
@@ -576,6 +599,10 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             image_tensors.append(current_image_tensor)
             landmark_tensors.append(landmarks_trans)
             mask_tensors.append(mask_trans)
+            if self.multi_crop and self.mode == 'test':
+                texture_score_tensors.append(current_texture_score_tensor)
+            else:
+                texture_score_tensors.append(None)
 
         if self.video_level:
             # Stack image tensors along a new dimension (time)
@@ -593,8 +620,9 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                 landmark_tensors = landmark_tensors[0]
             if not any(m is None or (isinstance(m, list) and None in m) for m in mask_tensors):
                 mask_tensors = mask_tensors[0]
+            texture_score_tensors = texture_score_tensors[0]
 
-        return image_tensors, label, landmark_tensors, mask_tensors
+        return image_tensors, label, landmark_tensors, mask_tensors, texture_score_tensors
 
     @staticmethod
     def collate_fn(batch):
@@ -610,7 +638,7 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             and the mask tensor.
         """
         # Separate the image, label, landmark, and mask tensors
-        images, labels, landmarks, masks = zip(*batch)
+        images, labels, landmarks, masks, texture_scores = zip(*batch)
 
         # Stack the image, label, landmark, and mask tensors
         images = torch.stack(images, dim=0)
@@ -627,12 +655,18 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         else:
             masks = None
 
+        if not any(t is None for t in texture_scores):
+            texture_scores = torch.stack(texture_scores, dim=0)
+        else:
+            texture_scores = None
+
         # Create a dictionary of the tensors
         data_dict = {}
         data_dict['image'] = images
         data_dict['label'] = labels
         data_dict['landmark'] = landmarks
         data_dict['mask'] = masks
+        data_dict['texture_scores'] = texture_scores
         return data_dict
 
     def __len__(self):
