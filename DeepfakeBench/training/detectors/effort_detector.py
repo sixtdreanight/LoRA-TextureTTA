@@ -258,22 +258,43 @@ class EffortDetector(nn.Module):
             b, n, c, h, w = images.shape
             # 将 Batch 和 Crops 维度合并进行特征提取
             flat_images = images.view(-1, c, h, w)
-            feats = self.backbone(flat_images)['pooler_output'] # [B*5, 1024]
-            preds = self.classifier(feats) # [B*5, 2]
-            probs = torch.softmax(preds, dim=1)[:, 1] # [B*5]
-        
-            # 恢复成 [B, 5] 进行置信度选择 (TAA 逻辑)
-            probs = probs.view(b, n)
-            feats = feats.view(b, n, -1)
-        
-            # 寻找偏离 0.5 最近/最远的作为最终预测（原 TAA 逻辑）
-            conf = torch.abs(probs - 0.5)
-            max_idx = torch.argmax(conf, dim=1)
-        
-            final_prob = probs[torch.arange(b), max_idx]
-            final_feat = feats[torch.arange(b), max_idx, :]
-            final_pred = preds.view(b, n, -1)[torch.arange(b), max_idx, :]
-        
+            feats = self.backbone(flat_images)['pooler_output']  # [B*N, 1024]
+            preds = self.classifier(feats)                        # [B*N, 2]
+            probs = torch.softmax(preds, dim=1)[:, 1]            # [B*N]
+            probs = probs.view(b, n)                              # [B, N]
+            feats = feats.view(b, n, -1)                          # [B, N, 1024]
+            preds = preds.view(b, n, -1)                          # [B, N, 2]
+
+            texture_scores = data_dict.get('texture_scores', None)  # [B, N] or None
+
+            if texture_scores is not None:
+                # ── Texture-aware weighted ensemble (formula step 3 & 4) ──
+                # Index 0: full image → s_full = f(I)
+                # Index 1..N-1: selected patches P* → s_j = f(resize(P_j))
+                s_full    = probs[:, 0]                                    # [B]
+                s_patches = probs[:, 1:]                                   # [B, N-1]
+                # t_j: patch texture scores (skip sentinel 0 at index 0)
+                t_j = texture_scores[:, 1:].to(images.device).float()     # [B, N-1]
+
+                gamma = self.config.get('texture_gamma', 1.5) if self.config else 1.5
+                beta  = self.config.get('texture_beta',  0.5) if self.config else 0.5
+
+                # w_j = t_j^γ / Σ_k t_k^γ
+                t_gamma = t_j ** gamma                                      # [B, N-1]
+                w = t_gamma / (t_gamma.sum(dim=1, keepdim=True) + 1e-8)   # [B, N-1]
+
+                # S(I) = β·s_full + (1-β)·Σ_j w_j·s_j
+                final_prob = beta * s_full + (1 - beta) * (w * s_patches).sum(dim=1)  # [B]
+                final_feat = feats[:, 0, :]   # use full-image feat as representative
+                final_pred = preds[:, 0, :]
+            else:
+                # ── Original TAA logic (unchanged for non-texture mode) ──
+                conf = torch.abs(probs - 0.5)
+                max_idx = torch.argmax(conf, dim=1)
+                final_prob = probs[torch.arange(b), max_idx]
+                final_feat = feats[torch.arange(b), max_idx, :]
+                final_pred = preds[torch.arange(b), max_idx, :]
+
             return {'cls': final_pred, 'prob': final_prob, 'feat': final_feat}
     
         # 原有的正常训练/推理流程
@@ -281,4 +302,3 @@ class EffortDetector(nn.Module):
         pred = self.classifier(features)
         prob = torch.softmax(pred, dim=1)[:, 1]
         return {'cls': pred, 'prob': prob, 'feat': features}
-            
