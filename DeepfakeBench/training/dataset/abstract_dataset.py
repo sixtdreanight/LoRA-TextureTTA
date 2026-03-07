@@ -464,70 +464,6 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
 
         return augmented_img, augmented_landmark, augmented_mask
 
-    @staticmethod
-    def _texture_patches(image, resolution, Kr=3, Ks=3, patch_size=224, gamma=1.5):
-        """
-        Extract texture-aware patches as described in the dual-texture selection formulation.
-
-        Steps:
-          1. Tile the image into overlapping patches of size patch_size×patch_size
-             with stride = patch_size // 2.
-          2. For each patch compute texture richness:
-               t_i = Var( Laplacian( gray(P_i) ) )
-          3. Rich set  R : top-Kr patches (highest t_i).
-             Simple set S : top-Ks patches (lowest t_i).
-          4. Resize every selected patch to resolution×resolution.
-
-        Args:
-            image      : H×W×3 numpy array (uint8, RGB).
-            resolution : target side length for the model input.
-            Kr, Ks     : number of rich / simple patches to select.
-            patch_size : sliding-window patch side length (pixels).
-            gamma      : texture-weight exponent (kept for API completeness;
-                         weighting is applied in the detector, not here).
-
-        Returns:
-            List of (patch_np, texture_score) tuples, rich patches first.
-        """
-        h, w = image.shape[:2]
-        stride = patch_size // 2
-
-        patches, scores = [], []
-        y = 0
-        while y + patch_size <= h:
-            x = 0
-            while x + patch_size <= w:
-                patch = image[y:y + patch_size, x:x + patch_size]
-                gray  = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
-                lap   = cv2.Laplacian(gray, cv2.CV_64F)
-                t     = float(np.var(lap))
-                patches.append(patch)
-                scores.append(t)
-                x += stride
-            y += stride
-
-        # Fallback: if the image is smaller than patch_size just return the full image
-        if len(patches) == 0:
-            resized = cv2.resize(image, (resolution, resolution))
-            return [(resized, 0.0)] * (Kr + Ks)
-
-        scores_arr = np.array(scores)
-        order      = np.argsort(scores_arr)          # ascending
-
-        # Rich: highest texture scores; Simple: lowest texture scores
-        rich_idx   = order[-(Kr):][::-1]             # top-Kr  (high t)
-        simple_idx = order[:Ks]                       # top-Ks  (low  t)
-
-        # Deduplicate while preserving rich-first order
-        seen, selected = set(), []
-        for idx in list(rich_idx) + list(simple_idx):
-            if idx not in seen:
-                seen.add(idx)
-                resized = cv2.resize(patches[idx], (resolution, resolution))
-                selected.append((resized, scores[idx]))
-
-        return selected
-
     def __getitem__(self, index, no_norm=False):
         """
         Returns the data point at the given index.
@@ -603,38 +539,33 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
             # To tensor and normalize
             if self.multi_crop and self.mode=='test':
                 res = self.config['resolution']
+                h, w = image_trans.shape[:2]
+                crop_radio = self.config.get('crop_radio', 0.8)
+                num_crops = self.config.get('num_crops', 5)
+                crop_h, crop_w = int(h*crop_radio), int(w*crop_radio)
+                crops = []
+                texture_scores = []
+                for _ in range(num_crops):
+                    y1 = random.randint(0, h - crop_h)
+                    x1 = random.randint(0, w - crop_w)
+                    crop_img = image_trans[y1:y1+crop_h, x1:x1+crop_w]
+                    crop_img = cv2.resize(crop_img, (res, res))
+                    # compute texture richness: Var(Laplacian(gray(P)))
+                    gray = cv2.cvtColor(crop_img, cv2.COLOR_RGB2GRAY)
+                    texture_scores.append(float(np.var(cv2.Laplacian(gray, cv2.CV_64F))))
+                    t_crop = self.to_tensor(crop_img)
+                    if not no_norm:
+                        t_crop = self.normalize(t_crop)
+                    crops.append(t_crop)
+                # if use_texture_crop: keep top-Kr rich + top-Ks simple; else keep all
                 if self.use_texture_crop:
-                    # ---- Dual-texture patch selection (test-time, O(1) cost) ----
                     Kr = self.config.get('texture_Kr', 3)
                     Ks = self.config.get('texture_Ks', 3)
-                    patch_size = self.config.get('texture_patch_size', 224)
-                    gamma = self.config.get('texture_gamma', 1.5)
-                    selected = self._texture_patches(
-                        image_trans, res, Kr=Kr, Ks=Ks,
-                        patch_size=patch_size, gamma=gamma
-                    )
-                    crops = []
-                    for patch_np, _ in selected:
-                        t_crop = self.to_tensor(patch_np)
-                        if not no_norm:
-                            t_crop = self.normalize(t_crop)
-                        crops.append(t_crop)
-                else:
-                    # ---- Original random multi-crop (unchanged) ----
-                    h, w = image_trans.shape[:2]
-                    crop_radio = self.config.get('crop_radio', 0.8)
-                    num_crops = self.config.get('num_crops', 5)
-                    crop_h, crop_w = int(h*crop_radio), int(w*crop_radio)
-                    crops = []
-                    for _ in range(num_crops):
-                        y1 = random.randint(0, h - crop_h)
-                        x1 = random.randint(0, w - crop_w)
-                        crop_img = image_trans[y1:y1+crop_h, x1:x1+crop_w]
-                        crop_img = cv2.resize(crop_img, (res, res))
-                        t_crop = self.to_tensor(crop_img)
-                        if not no_norm:
-                            t_crop = self.normalize(t_crop)
-                        crops.append(t_crop)
+                    order = np.argsort(texture_scores)
+                    idx = list(dict.fromkeys(
+                        list(order[-(Kr):][::-1]) + list(order[:Ks])
+                    ))
+                    crops = [crops[i] for i in idx]
 
                 current_image_tensor = torch.stack(crops, dim=0)
             else:
