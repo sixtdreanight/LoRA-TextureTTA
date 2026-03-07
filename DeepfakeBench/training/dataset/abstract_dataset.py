@@ -1,8 +1,3 @@
-# author: Zhiyuan Yan
-# email: zhiyuanyan@link.cuhk.edu.cn
-# date: 2023-03-30
-# description: Abstract Base Class for all types of deepfake datasets.
-
 import sys
 
 import lmdb
