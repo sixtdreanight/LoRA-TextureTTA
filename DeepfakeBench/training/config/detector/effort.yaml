@@ -98,3 +98,4 @@ texture_Kr: 3        # 可选，默认3
 texture_Ks: 3        # 可选，默认3
 texture_patch_size: 224   # 可选，默认224
 texture_gamma: 2        # 可选，默认1.5（供detector侧加权用）
+texture_beta : 0.5
