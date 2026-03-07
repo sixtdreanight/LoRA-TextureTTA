@@ -96,6 +96,6 @@ num_crops: 5           # 随机crop数量（默认5）
 use_texture_crop: true # 切换到纹理选patch模式
 texture_Kr: 3        # 可选，默认3
 texture_Ks: 3        # 可选，默认3
-texture_patch_size: 224   # 可选，默认224
-texture_gamma: 2        # 可选，默认1.5（供detector侧加权用）
+texture_patch_size: 112   # 可选，默认224
+texture_gamma: 1.5        # 可选，默认1.5（供detector侧加权用）
 texture_beta : 0.5
