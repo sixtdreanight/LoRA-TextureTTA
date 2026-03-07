@@ -294,6 +294,26 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
         return frame_path_list, label_list, video_name_list
 
 
+    def load_rgb_original(self, file_path):
+        """Load RGB image WITHOUT resizing (needed for texture sliding-window)."""
+        file_path = file_path.replace('\\', '/')
+        base_data_path = '/home/user1/effort/data'
+        if not file_path.startswith('/'):
+            file_path = os.path.join(base_data_path, file_path)
+        if not self.lmdb:
+            assert os.path.exists(file_path), f"{file_path} does not exist"
+            img = cv2.imread(file_path)
+            if img is None:
+                img = cv2.cvtColor(np.array(Image.open(file_path)), cv2.COLOR_RGB2BGR)
+        else:
+            with self.env.begin(write=False) as txn:
+                if file_path[0] == '.':
+                    file_path = file_path.replace('./datasets\\', '')
+                image_bin = txn.get(file_path.encode())
+                image_buf = np.frombuffer(image_bin, dtype=np.uint8)
+                img = cv2.imdecode(image_buf, cv2.IMREAD_COLOR)
+        return np.array(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), dtype=np.uint8)
+
     def load_rgb(self, file_path):
         """
         Load an RGB image from a file path and resize it to a specified resolution.
@@ -544,7 +564,8 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                 all_imgs, all_scores = [], []
 
                 if self.use_texture_crop:
-                    # ── Step 2: sliding-window patch extraction (stride = p/2) ──
+                    # ── Step 2: sliding-window patch extraction (stride = patch_size // 2) ──
+                    # image_trans is already resized to res×res by load_rgb
                     patch_size = self.config.get('texture_patch_size', res // 2)
                     stride = patch_size // 2
                     Kr = self.config.get('texture_Kr', 3)
@@ -560,15 +581,15 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                             raw_patches.append(cv2.resize(patch, (res, res)))
                             x += stride
                         y += stride
-                    if len(raw_patches) == 0:          # fallback: image smaller than patch
-                        raw_patches = [cv2.resize(image_trans, (res, res))]
+                    if len(raw_patches) == 0:   # fallback: patch_size >= image size
+                        raw_patches = [image_trans.copy()]
                         raw_scores = [1.0]
                     # ── Select P* = R ∪ S ──
                     order = np.argsort(raw_scores)
                     idx = list(dict.fromkeys(list(order[-Kr:][::-1]) + list(order[:Ks])))
-                    # ── Prepend full image as index-0 (for s_full); sentinel score = 0 ──
-                    all_imgs  = [cv2.resize(image_trans, (res, res))] + [raw_patches[i] for i in idx]
-                    all_scores = [0.0] + [raw_scores[i] for i in idx]
+                    # ── index-0 = full image (s_full), sentinel score = 0 ──
+                    all_imgs   = [image_trans.copy()] + [raw_patches[i] for i in idx]
+                    all_scores = [0.0]            + [raw_scores[i]  for i in idx]
                 else:
                     # ── Original random multi-crop (unchanged) ──
                     crop_radio = self.config.get('crop_radio', 0.8)
@@ -590,7 +611,12 @@ class DeepfakeAbstractBaseDataset(data.Dataset):
                         t = self.normalize(t)
                     crops.append(t)
                 current_image_tensor = torch.stack(crops, dim=0)
-                current_texture_score_tensor = torch.tensor(all_scores, dtype=torch.float32)
+                # only pass scores when use_texture_crop=True so detector
+                # can fall back to TAA when use_texture_crop=False
+                current_texture_score_tensor = (
+                    torch.tensor(all_scores, dtype=torch.float32)
+                    if self.use_texture_crop else None
+                )
             else:
                 current_image_tensor = self.to_tensor(image_trans)
                 if not no_norm:
