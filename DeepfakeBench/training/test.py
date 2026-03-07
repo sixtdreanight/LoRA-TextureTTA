@@ -128,7 +128,9 @@ def test_epoch(model, test_data_loaders):
 
         # 【核心修改点】：获取模型在跑完该数据集后最终稳定的动态阈值
         global prediction_queue
+        
         final_adaptive_th = calculate_adaptive_threshold(prediction_queue)
+        
         tqdm.write(f"Using Adaptive Threshold: {final_adaptive_th:.4f}")
 
         pred_labels = (predictions_nps > final_adaptive_th).astype(int)
@@ -145,8 +147,13 @@ def test_epoch(model, test_data_loaders):
 
         # info for each dataset
         tqdm.write(f"dataset: {key}")
+        # for k, v in metric_one_dataset.items():
+        #     tqdm.write(f"{k}: {v}")
+        
+        skip_keys = {'pred', 'label'}
         for k, v in metric_one_dataset.items():
-            tqdm.write(f"{k}: {v}")
+            if k not in skip_keys:
+                tqdm.write(f"{k}: {v}")
 
     return metrics_all_datasets
 
