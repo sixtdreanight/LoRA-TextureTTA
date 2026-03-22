@@ -99,3 +99,10 @@ texture_Ks: 3        # 可选，默认3
 texture_patch_size: 112   # 可选，默认224
 texture_gamma: 1.5        # 可选，默认1.5（供detector侧加权用）
 texture_beta : 0.5
+
+# Asymmetric Center Loss (margin loss)
+# margin_loss_mode: 'off' | 'add' | 'replace'
+margin_loss_mode: add
+margin_m: 0.5    # 针对大多数高质量deepfake（cos_sim>0.875）激活
+                 # 若想覆盖更多deepfake，调大到 0.8（cos_sim>0.68即激活）
+margin_weight: 0.5
