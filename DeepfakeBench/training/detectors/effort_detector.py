@@ -104,9 +104,18 @@ class EffortDetector(nn.Module):
         self.loss_func = nn.CrossEntropyLoss()
         self.prob, self.label = [], []
         self.correct, self.total = 0, 0
-        
-        # --- 新增：自适应阈值队列 ---
+
+        # --- 自适应阈值队列 ---
         self.prediction_queue = []
+
+        # --- Asymmetric Center Loss (margin loss) ---
+        # margin_loss_mode: 'off' | 'add' | 'replace'
+        self.margin_loss_mode = config.get('margin_loss_mode', 'off') if config else 'off'
+        self.margin_m = float(config.get('margin_m', 0.5)) if config else 0.5
+        self.margin_weight = float(config.get('margin_weight', 1.0)) if config else 1.0
+        if self.margin_loss_mode != 'off':
+            # learnable center c_R, normalized in loss; randn init puts it in feature space
+            self.center = nn.Parameter(torch.randn(1024))
 
     def build_backbone(self, config):
         # ⚠⚠⚠ Download CLIP model using the below link
@@ -191,6 +200,22 @@ class EffortDetector(nn.Module):
     def classifier(self, features: torch.tensor) -> torch.tensor:
         return self.head(features)
 
+    def asymmetric_center_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        L = (1/N) Σ [ y_i·‖f̂(x_i)-ĉ_R‖² + (1-y_i)·max(0, m-‖f̂(x_i)-ĉ_R‖)² ]
+        Features and center are L2-normalized before distance computation so that
+        dist ∈ [0, 2], making margin_m meaningful (recommended: 0.3~0.8).
+        Convention: label=0 → Real (y_i=1), label=1 → Fake (y_i=0)
+        """
+        f_norm = F.normalize(features, dim=1)                              # [B, 1024]
+        c_norm = F.normalize(self.center.unsqueeze(0), dim=1)             # [1, 1024]
+        dist = torch.norm(f_norm - c_norm, dim=1)                         # [B], ∈ [0,2]
+        real = (labels == 0).float()                                       # y_i=1
+        fake = (labels == 1).float()                                       # y_i=0
+        loss = (real * dist ** 2 +
+                fake * torch.clamp(self.margin_m - dist, min=0) ** 2).mean()
+        return loss
+
     def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
         label = data_dict['label']
         pred = pred_dict['cls']
@@ -219,6 +244,15 @@ class EffortDetector(nn.Module):
             'real_loss': loss_real,
             'fake_loss': loss_fake,
         }
+
+        if self.margin_loss_mode != 'off':
+            margin_loss = self.asymmetric_center_loss(pred_dict['feat'], label)
+            loss_dict['margin_loss'] = margin_loss
+            if self.margin_loss_mode == 'replace':
+                loss_dict['overall'] = margin_loss
+            else:  # 'add'
+                loss_dict['overall'] = loss + self.margin_weight * margin_loss
+
         return loss_dict
 
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
