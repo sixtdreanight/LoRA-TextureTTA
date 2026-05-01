@@ -31,8 +31,107 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from sklearn import metrics
 from metrics.utils import get_test_metrics
 
+from optimizor.sam import SAM
+from optimizor.pcgrad import PCGrad
+
 FFpp_pool=['FaceForensics++','FF-DF','FF-F2F','FF-FS','FF-NT']#
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ── Asymmetric Mixup ──────────────────────────────────────────────────────────
+def asymmetric_mixup(x, y, alpha=1.0, gamma=5.0):
+    """
+    Asymmetric Mixup: Real-Real / Fake-Fake → standard mixup label;
+    Real-Fake → y_mixed = 1 - (real_prop ** gamma)  (aggressively Fake).
+    y=0 → Real, y=1 → Fake.
+    Returns mixed images and soft labels in [0, 1].
+    """
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    index = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y.float(), y[index].float()
+    lam_t = torch.tensor(lam, dtype=torch.float32, device=x.device)
+    # proportion of the Fake image in the blend
+    lam_fake = torch.where(y_a == 1.0, lam_t, 1.0 - lam_t)
+    mixed_y_std  = lam * y_a + (1 - lam) * y_b               # same-class pairs
+    mixed_y_asym = 1.0 - (1.0 - lam_fake) ** gamma            # cross-class pairs
+    mixed_y = torch.where(y_a == y_b, mixed_y_std, mixed_y_asym)
+    return mixed_x, mixed_y
+
+
+def hardest_k_mixup(model, data_dict, K, alpha=1.0, gamma=5.0):
+    """
+    For each real image in the batch, generate K fake mixing candidates,
+    forward all K*R samples (no grad), and retain only the hardest candidate
+    (highest per-sample soft-CE loss) per real image.
+
+    Falls back to asymmetric_mixup when K<=1 or the batch has only one class.
+    """
+    x, y = data_dict['image'], data_dict['label']
+    real_idx = (y == 0).nonzero(as_tuple=True)[0]   # [R]
+    fake_idx = (y == 1).nonzero(as_tuple=True)[0]   # [F]
+
+    if K <= 1 or len(real_idx) == 0 or len(fake_idx) == 0:
+        mixed_x, label_soft = asymmetric_mixup(x, y, alpha, gamma)
+        return {**data_dict, 'image': mixed_x, 'label_soft': label_soft}
+
+    R = len(real_idx)
+
+    # ── Sample independent lambda_j per candidate ──────────────────────────
+    lam_k = np.random.beta(alpha, alpha, size=K) if alpha > 0 else np.ones(K)
+    lam_t_k = x.new_tensor(lam_k).float()                                 # [K]
+
+    # Asymmetric soft label per candidate
+    soft_val_k = 1.0 - (lam_t_k ** gamma)                                 # [K]
+
+    # ── Build K*R mixed images ─────────────────────────────────────────────
+    # cand_fake_global[k, r] = global batch index of the k-th fake candidate for real r
+    cand_fake_global = fake_idx[
+        torch.randint(len(fake_idx), (K, R), device=x.device)
+    ]                                                                     # [K, R]
+
+    x_real_rep = (x[real_idx]
+                  .unsqueeze(0)
+                  .expand(K, -1, -1, -1, -1)
+                  .reshape(K * R, *x.shape[1:]))                         # [K*R, C, H, W]
+    x_fake_rep = x[cand_fake_global.reshape(-1)]                         # [K*R, C, H, W]
+
+    # Expand lam to [K*R, 1, 1, 1] for per-candidate mixing
+    lam_exp = lam_t_k.view(K, 1, 1, 1, 1).expand(K, R, *x.shape[1:])
+    lam_exp = lam_exp.reshape(K * R, *x.shape[1:])                       # [K*R, C, H, W]
+    mixed_kr = lam_exp * x_real_rep + (1.0 - lam_exp) * x_fake_rep
+
+    # Expand soft_val to [K*R] for per-candidate loss
+    soft_val_exp = soft_val_k.view(K, 1).expand(K, R).reshape(-1)        # [K*R]
+
+    # ── Selection forward pass (no gradient) ──────────────────────────────
+    model_module = model.module if hasattr(model, 'module') else model
+    with torch.no_grad():
+        feat_kr = model_module.features({**data_dict, 'image': mixed_kr})  # [K*R, D]
+        pred_kr = model_module.classifier(feat_kr)                          # [K*R, 2]
+
+    log_p   = F.log_softmax(pred_kr, dim=1)                               # [K*R, 2]
+    loss_kr = -(soft_val_exp * log_p[:, 1] +
+                (1.0 - soft_val_exp) * log_p[:, 0])                       # [K*R]
+
+    # ── Pick hardest fake per real ─────────────────────────────────────────
+    # Layout of mixed_kr: [k*R + r] → (k, r)
+    best_k    = loss_kr.view(K, R).argmax(dim=0)                          # [R]
+    flat_idx  = best_k * R + torch.arange(R, device=x.device)            # [R]
+    selected  = mixed_kr[flat_idx]                                         # [R, C, H, W]
+    # Select corresponding soft labels for the chosen candidates
+    selected_soft = soft_val_exp[flat_idx]                                 # [R]
+
+    # ── Reconstruct full batch ─────────────────────────────────────────────
+    new_x = x.clone()
+    new_x[real_idx] = selected
+
+    # soft label: mixed real positions get their per-candidate soft_val; fake positions keep 1.0
+    label_soft = y.float().clone()
+    label_soft[real_idx] = selected_soft
+
+    return {**data_dict, 'image': new_x, 'label_soft': label_soft}
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class Trainer(object):
@@ -202,10 +301,24 @@ class Trainer(object):
                 losses = self.model.module.get_losses(data_dict, predictions)
             else:
                 losses = self.model.get_losses(data_dict, predictions)
-            self.optimizer.zero_grad()
-            losses['overall'].backward()
-            #self.model.module.set_mask_grad()
-            self.optimizer.step()
+            # self.optimizer.zero_grad()
+            # losses['overall'].backward()
+            # #self.model.module.set_mask_grad()
+            # self.optimizer.step()
+            if isinstance(self.optimizer, SAM):
+                losses['overall'].backward()
+                self.optimizer.first_step(zero_grad=True)
+                losses2 = self.model.get_losses(data_dict, self.model(data_dict))
+                losses2['overall'].backward()
+                self.optimizer.second_step(zero_grad=True)
+            elif isinstance(self.optimizer, PCGrad):
+                self.optimizer.zero_grad()
+                self.optimizer.pc_backward([losses['real_loss'], losses['fake_loss']])
+                self.optimizer.step()
+            else:
+                self.optimizer.zero_grad()
+                losses['overall'].backward()
+                self.optimizer.step()
 
 
             return losses,predictions
@@ -244,6 +357,20 @@ class Trainer(object):
                 if data_dict[key]!=None and key!='name':
                     data_dict[key]=data_dict[key].cuda()
 
+            # ── Asymmetric Mixup (training only) ──────────────────────────
+            if self.config.get('use_mixup', False):
+                mixup_k = self.config.get('mixup_k', 1)
+                alpha   = self.config.get('mixup_alpha', 1.0)
+                gamma   = self.config.get('mixup_gamma', 5.0)
+                if mixup_k > 1:
+                    data_dict = hardest_k_mixup(
+                        self.model, data_dict, K=mixup_k, alpha=alpha, gamma=gamma,
+                    )
+                else:
+                    data_dict['image'], data_dict['label_soft'] = asymmetric_mixup(
+                        data_dict['image'], data_dict['label'], alpha=alpha, gamma=gamma,
+                    )
+            # ──────────────────────────────────────────────────────────────
             losses,predictions=self.train_step(data_dict)
 
             # update learning rate
