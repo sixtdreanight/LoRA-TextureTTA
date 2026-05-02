@@ -93,7 +93,7 @@ use_loralib: true
 multi_crop: true       # 是否开启多crop（默认false）
 crop_radio: 0.8        # 随机crop比例（默认0.8）
 num_crops: 5           # 随机crop数量（默认5）
-use_texture_crop: true # 切换到纹理选patch模式
+use_texture_crop: false # 切换到纹理选patch模式
 texture_Kr: 3        # 可选，默认3
 texture_Ks: 3        # 可选，默认3
 texture_patch_size: 112   # 可选，默认224
@@ -102,13 +102,16 @@ texture_beta : 0.5
 
 # Asymmetric Center Loss (margin loss)
 # margin_loss_mode: 'off' | 'add' | 'replace'
-margin_loss_mode: add
+margin_loss_mode: off
 margin_m: 0.5    # 针对大多数高质量deepfake（cos_sim>0.875）激活
                  # 若想覆盖更多deepfake，调大到 0.8（cos_sim>0.68即激活）
 margin_weight: 0.5
 
+optimizer_wrapper: null   # null | sam | pcgrad
+sam_rho: 0.05
+
 # Asymmetric Mixup
 use_mixup: true       # set true to enable, or pass --mixup_gamma on CLI
 mixup_gamma: 0.2      # Asymmetry intensity: higher = more aggressive Fake label
-mixup_k: 4            # K for Hardest-K Mixup (1=standard asymmetric, >1 enables hardest selection)
-mixup_alpha: 1.0      # Beta(alpha, alpha) parameter for lambda sampling
+mixup_k: 1            # K=1: standard asymmetric mixup (sweep best)
+mixup_alpha: 5.0      # Beta(alpha, alpha) — λ concentrates near 0.5

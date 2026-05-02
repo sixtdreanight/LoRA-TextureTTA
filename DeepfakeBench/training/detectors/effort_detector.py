@@ -165,28 +165,29 @@ class EffortDetector(nn.Module):
         
         return clip_model.vision_model
 
-    # --- 新增：OWTTT 动态阈值计算方法 ---
+    # --- OWTTT 动态阈值计算 (ICCV23, Yushu-Li/OWTTT) ---
     def compute_adaptive_threshold(self, gap_weight=0.01, max_len=512):
         if len(self.prediction_queue) < 32:
             return 0.5
-        
+
         os = np.array(self.prediction_queue[-max_len:], dtype=float)
-        threshold_range = np.arange(0.1, 0.9, 0.01)
+        threshold_range = np.arange(0, 1, 0.01)
         best_th = 0.5
         min_crit = float('inf')
-        
+
         for th in threshold_range:
             mask = os >= th
             nb = os.size
             nb1 = np.count_nonzero(mask)
             w1 = nb1 / nb
             w0 = 1 - w1
-            if w1 == 0 or w0 == 0: continue
-            
+            if w1 == 0 or w0 == 0:
+                continue
+
             v0 = np.var(os[~mask])
             v1 = np.var(os[mask])
             min_gap = np.min(np.abs(os - th))
-            
+
             crit = w0 * v0 + w1 * v1 - gap_weight * min_gap
             if crit < min_crit:
                 min_crit = crit
@@ -220,7 +221,15 @@ class EffortDetector(nn.Module):
         label = data_dict['label']
         pred = pred_dict['cls']
 
-        loss = self.loss_func(pred, label)
+        # ── Soft-label cross-entropy when Asymmetric Mixup is active ──────────
+        if 'label_soft' in data_dict:
+            log_probs = F.log_softmax(pred, dim=1)          # [B, 2]
+            y_soft = data_dict['label_soft']                # [B], values in [0,1]
+            loss = -(y_soft * log_probs[:, 1] +
+                     (1.0 - y_soft) * log_probs[:, 0]).mean()
+        else:
+            loss = self.loss_func(pred, label)
+        # ─────────────────────────────────────────────────────────────────────
 
         mask_real = label == 0
         mask_fake = label == 1
@@ -258,21 +267,11 @@ class EffortDetector(nn.Module):
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
         label = data_dict['label']
         prob = pred_dict['prob']
-        
-        # 更新队列
-        self.prediction_queue.extend(prob.detach().cpu().numpy().tolist())
-        if len(self.prediction_queue) > 1000:
-            self.prediction_queue = self.prediction_queue[-1000:]
-            
-        # 计算当前最优阈值
-        current_th = self.compute_adaptive_threshold()
-        
-        # 使用动态阈值判定标签并计算 Acc
-        pred_label = (prob > current_th).long()
+
+        pred_label = (prob > 0.5).long()
         correct = (pred_label == label.detach()).sum().item()
         acc = correct / len(label)
-        
-        # 其他指标保持原样
+
         auc, eer, _, ap = calculate_metrics_for_train(label.detach(), pred_dict['cls'].detach())
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
         return metric_batch_dict

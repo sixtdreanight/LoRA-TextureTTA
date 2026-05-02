@@ -566,6 +566,18 @@ class Trainer(object):
             # print(f'stack len:{predictions_nps.shape};{label_nps.shape};{len(data_dict["image"])}')
             losses_all_datasets[key] = losses_one_dataset_recorder
             metric_one_dataset=get_test_metrics(y_pred=predictions_nps,y_true=label_nps,img_names=data_dict['image'])
+
+            # Adaptive threshold (OWTTT) for zero-shot NTTA
+            model_module = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(model_module, 'compute_adaptive_threshold'):
+                model_module.prediction_queue.extend(predictions_nps.tolist())
+                if len(model_module.prediction_queue) > 1000:
+                    model_module.prediction_queue = model_module.prediction_queue[-1000:]
+                adaptive_th = model_module.compute_adaptive_threshold()
+                metric_one_dataset['acc_adaptive'] = float(
+                    np.mean((predictions_nps > adaptive_th).astype(int) == label_nps)
+                )
+
             for metric_name, value in metric_one_dataset.items():
                 if metric_name in avg_metric:
                     avg_metric[metric_name]+=value
