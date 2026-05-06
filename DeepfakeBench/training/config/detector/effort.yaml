@@ -1,0 +1,118 @@
+# log dir 
+log_dir: ./zhiyuanyan/logs/benchv2/icml25/release
+
+# model setting
+pretrained: 'no need to provide this for the effort model'
+model_name: effort   # model name
+backbone_name: vit  # backbone name
+
+#backbone setting
+backbone_config:
+  mode: original
+  num_classes: 2
+  inc: 3
+  dropout: false
+
+# dataset
+all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV]
+train_dataset: [FaceForensics++]
+test_dataset: [Celeb-DF-v2, FaceShifter, DeeperForensics-1.0]
+
+
+compression: c23  # compression-level for videos
+train_batchSize: 32   # training batch size
+test_batchSize: 32   # test batch size
+workers: 8   # number of data loading workers
+frame_num: {'train': 8, 'test': 8}   # number of frames to use per video in training and testing
+resolution: 224   # resolution of output image to network
+with_mask: false   # whether to include mask information in the input
+with_landmark: false   # whether to include facial landmark information in the input
+
+
+# data augmentation
+use_data_augmentation: true  # Add this flag to enable/disable data augmentation
+data_aug:
+  flip_prob: 0.5
+  rotate_prob: 0.5
+  rotate_limit: [-10, 10]
+  blur_prob: 0.5
+  blur_limit: [3, 7]
+  brightness_prob: 0.5
+  brightness_limit: [-0.1, 0.1]
+  contrast_limit: [-0.1, 0.1]
+  quality_lower: 40
+  quality_upper: 100
+
+# mean and std for normalization
+mean: [0.48145466, 0.4578275, 0.40821073]
+std: [0.26862954, 0.26130258, 0.27577711]
+
+# optimizer config
+optimizer:
+  # choose between 'adam' and 'sgd'
+  type: adam
+  adam:
+    lr: 0.0002  # learning rate
+    beta1: 0.9  # beta1 for Adam optimizer
+    beta2: 0.999 # beta2 for Adam optimizer
+    eps: 0.00000001  # epsilon for Adam optimizer
+    weight_decay: 0.0005  # weight decay for regularization
+    amsgrad: false
+  sgd:
+    lr: 0.0002  # learning rate
+    momentum: 0.9  # momentum for SGD optimizer
+    weight_decay: 0.0005  # weight decay for regularization
+
+# training config
+lr_scheduler: null   # learning rate scheduler
+nEpochs: 10   # number of epochs to train for
+start_epoch: 0   # manual epoch number (useful for restarts)
+save_epoch: 1   # interval epochs for saving models
+rec_iter: 100   # interval iterations for recording
+logdir: ./logs   # folder to output images and logs
+manualSeed: 1024   # manual seed for random number generation
+save_ckpt: true   # whether to save checkpoint
+save_feat: true   # whether to save features
+
+# loss function
+loss_func: cross_entropy   # loss function to use
+losstype: null
+
+# metric
+metric_scoring: auc   # metric for evaluation (auc, acc, eer, ap)
+
+# cuda
+ngpu: 1   # number of GPUs to use
+cuda: true   # whether to use CUDA acceleration
+cudnn: true   # whether to use CuDNN for convolution operations
+
+save_avg: true
+
+use_loralib: true
+
+multi_crop: true       # 是否开启多crop（默认false）
+crop_radio: 0.8        # 随机crop比例（默认0.8）
+num_crops: 5           # 随机crop数量（默认5）
+use_texture_crop: false # 切换到纹理选patch模式
+texture_Kr: 3        # 可选，默认3
+texture_Ks: 3        # 可选，默认3
+texture_patch_size: 112   # 可选，默认224
+texture_gamma: 1.5        # 可选，默认1.5（供detector侧加权用）
+texture_beta : 0.5
+
+# Asymmetric Center Loss (margin loss)
+# margin_loss_mode: 'off' | 'add' | 'replace'
+margin_loss_mode: off
+margin_m: 0.5    # 针对大多数高质量deepfake（cos_sim>0.875）激活
+                 # 若想覆盖更多deepfake，调大到 0.8（cos_sim>0.68即激活）
+margin_weight: 0.5
+
+optimizer_wrapper: null   # null | sam | pcgrad
+sam_rho: 0.05
+
+# Asymmetric Mixup
+use_mixup: true       # set true to enable, or pass --mixup_gamma on CLI
+mixup_gamma: 1.0      # Asymmetry intensity: γ=1 → standard Mixup labels
+mixup_k: 3            # K for multi-candidate mixup
+mixup_alpha: 5.0      # Beta(alpha, alpha) — λ concentrates near 0.5
+mixup_selection: random  # 'hardest' or 'random' — ablation experiment

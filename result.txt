@@ -1,0 +1,77 @@
+mixup_gamma: 0.2
+mixup_k: 1
+mixup_alpha: 5.0
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.8248146717666646
+auc: 0.9165933513791855
+eer: 0.14836142123453458
+ap: 0.9498400010437432
+video_auc: 0.9439162506157498
+video_eer: 0.12742349298200284
+video_acc: 0.7972255139827445
+best_th: 0.5950000000000001
+
+mixup_gamma: 3.0     
+mixup_k: 1           
+mixup_alpha: 5.0
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.7754977480632229
+auc: 0.9166390130245374
+eer: 0.15258039127110898
+ap: 0.9473811788964421
+video_auc: 0.9446500796067712
+video_eer: 0.11453577149245063
+video_acc: 0.6306965981412739
+best_th: 0.7516666666666668
+
+mixup_gamma: 0.2     
+mixup_k: 2     
+mixup_alpha: 5.0
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.6248044963888599
+auc: 0.6059877748711013
+eer: 0.4246463277823654
+ap: 0.7007850491736775
+video_auc: 0.6091742346562906
+video_eer: 0.40877518055610357
+video_acc: 0.572388411010234
+best_th: 0.8649999999999999
+
+mixup_gamma: 3.0      # Asymmetry intensity: higher = more aggressive Fake label
+mixup_k: 2            # K for Hardest-K Mixup (1=standard asymmetric, >1 enables hardest selection)
+mixup_alpha: 5.0 
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.6258528927106322
+auc: 0.7990912627855488
+eer: 0.27785687646969554
+ap: 0.8811584024966379
+video_auc: 0.8026549177853068
+video_eer: 0.2793323159231152
+video_acc: 0.5719125944054735
+best_th: 0.9533333333333333
+
+mixup_gamma: 0.2      # Asymmetry intensity: higher = more aggressive Fake label
+mixup_k: 3            # K for Hardest-K Mixup (1=standard asymmetric, >1 enables hardest selection)
+mixup_alpha: 5.0      # Beta(alpha, alpha) parameter for lambda sampling
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.6243067590864492
+auc: 0.6190497579891349
+eer: 0.413766601491536
+ap: 0.6994376205725508
+video_auc: 0.6248581201608111
+video_eer: 0.413796833104692
+video_acc: 0.5719125944054735
+best_th: 0.7266666666666666
+
+mixup_gamma: 3.0      # Asymmetry intensity: higher = more aggressive Fake label
+mixup_k: 3            # K for Hardest-K Mixup (1=standard asymmetric, >1 enables hardest selection)
+mixup_alpha: 5.0      # Beta(alpha, alpha) parameter for lambda sampling
+dataset: average (over 6 datasets: Celeb-DF-v1, Celeb-DF-v2, DFDC, DFDCP, FaceForensics++, UADFV)
+acc: 0.6244011550037499
+auc: 0.728532116466019
+eer: 0.33074084471395276
+ap: 0.7985184118341085
+video_auc: 0.7461321097556094
+video_eer: 0.31814358308806523
+video_acc: 0.5719125944054735
+best_th: 0.6483333333333333

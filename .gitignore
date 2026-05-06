@@ -1,0 +1,7 @@
+models--*/
+weights/
+__pycache__/
+*.log
+*.pth
+*.pt
+*.ckpt
