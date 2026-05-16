@@ -61,10 +61,10 @@ def asymmetric_mixup(x, y, alpha=1.0, gamma=5.0):
 
 def hardest_k_mixup(model, data_dict, K, alpha=1.0, gamma=5.0, selection='hardest'):
     """
-    For each real image in the batch, generate K fake mixing candidates,
-    forward all K*R samples (no grad), and retain one candidate per real image.
-    selection='hardest': highest per-sample soft-CE loss.
-    selection='random': pick one candidate uniformly at random.
+    For each real image in the batch, generate K fake mixing candidates.
+    selection='hardest': forward K*R (no grad), pick highest per-sample soft-CE loss.
+    selection='random':   pick one candidate uniformly at random.
+    selection='mean':     keep all K candidates, average loss per real in get_losses.
 
     Falls back to asymmetric_mixup when K<=1 or the batch has only one class.
     """
@@ -104,6 +104,29 @@ def hardest_k_mixup(model, data_dict, K, alpha=1.0, gamma=5.0, selection='hardes
 
     # Expand soft_val to [K*R] for per-candidate loss
     soft_val_exp = soft_val_k.view(K, 1).expand(K, R).reshape(-1)        # [K*R]
+
+    # ── Mean over K candidates: keep all, loss averaged in get_losses ──────
+    if selection == 'mean':
+        if len(fake_idx) > 0:
+            partner = real_idx[torch.randint(len(real_idx), (len(fake_idx),), device=x.device)]
+            lam_f = np.random.beta(alpha, alpha, size=len(fake_idx)) if alpha > 0 else np.ones(len(fake_idx))
+            lam_f_t = x.new_tensor(lam_f).float()
+            lam_exp_f = lam_f_t.view(-1, 1, 1, 1).expand(-1, *x.shape[1:])
+            mixed_fake = lam_exp_f * x[fake_idx] + (1.0 - lam_exp_f) * x[partner]
+            fake_soft = 1.0 - ((1.0 - lam_f_t) ** gamma)
+            new_x = torch.cat([mixed_kr, mixed_fake], dim=0)       # [K*R + F, ...]
+            new_label_soft = torch.cat([soft_val_exp, fake_soft], dim=0)
+            new_label = torch.cat([
+                torch.zeros(K * R, dtype=y.dtype, device=y.device),
+                y[fake_idx]
+            ], dim=0)
+        else:
+            new_x = mixed_kr
+            new_label_soft = soft_val_exp
+            new_label = torch.zeros(K * R, dtype=y.dtype, device=y.device)
+        return {**data_dict, 'image': new_x, 'label': new_label,
+                'label_soft': new_label_soft,
+                'mixup_k': K, 'mixup_selection': 'mean'}
 
     # ── Selection forward pass (no gradient) ──────────────────────────────
     model_module = model.module if hasattr(model, 'module') else model
@@ -371,17 +394,18 @@ class Trainer(object):
 
             # ── Asymmetric Mixup (training only) ──────────────────────────
             if self.config.get('use_mixup', False):
-                mixup_k = self.config.get('mixup_k', 1)
                 alpha   = self.config.get('mixup_alpha', 1.0)
                 gamma   = self.config.get('mixup_gamma', 5.0)
-                if mixup_k > 1:
+                mixup_mode = self.config.get('mixup_mode', 'asymmetric')
+                if mixup_mode == 'original':
+                    data_dict['image'], data_dict['label_soft'] = asymmetric_mixup(
+                        data_dict['image'], data_dict['label'], alpha=alpha, gamma=gamma,
+                    )
+                else:
+                    mixup_k = self.config.get('mixup_k', 1)
                     data_dict = hardest_k_mixup(
                         self.model, data_dict, K=mixup_k, alpha=alpha, gamma=gamma,
                         selection=self.config.get('mixup_selection', 'hardest'),
-                    )
-                else:
-                    data_dict['image'], data_dict['label_soft'] = asymmetric_mixup(
-                        data_dict['image'], data_dict['label'], alpha=alpha, gamma=gamma,
                     )
             # ──────────────────────────────────────────────────────────────
             losses,predictions=self.train_step(data_dict)

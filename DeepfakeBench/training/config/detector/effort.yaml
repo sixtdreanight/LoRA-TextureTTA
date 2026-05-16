@@ -14,7 +14,7 @@ backbone_config:
   dropout: false
 
 # dataset
-all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV]
+all_dataset: [FaceForensics++, FF-F2F, FF-DF, FF-FS, FF-NT, FaceShifter, DeepFakeDetection, Celeb-DF-v1, Celeb-DF-v2, DFDCP, DFDC, DeeperForensics-1.0, UADFV, WDF, FFIW]
 train_dataset: [FaceForensics++]
 test_dataset: [Celeb-DF-v2, FaceShifter, DeeperForensics-1.0]
 
@@ -112,7 +112,8 @@ sam_rho: 0.05
 
 # Asymmetric Mixup
 use_mixup: true       # set true to enable, or pass --mixup_gamma on CLI
+mixup_mode: original  # 'original' = direct asymmetric_mixup, 'asymmetric' = K-candidate selection
 mixup_gamma: 1.0      # Asymmetry intensity: γ=1 → standard Mixup labels
-mixup_k: 3            # K for multi-candidate mixup
+mixup_k: 3            # K for multi-candidate mixup (only used when mixup_mode='asymmetric')
 mixup_alpha: 5.0      # Beta(alpha, alpha) — λ concentrates near 0.5
-mixup_selection: random  # 'hardest' or 'random' — ablation experiment
+mixup_selection: random  # 'hardest' or 'random' — ablation experiment (only used when mixup_mode='asymmetric')
