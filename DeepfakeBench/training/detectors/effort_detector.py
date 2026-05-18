@@ -229,11 +229,16 @@ class EffortDetector(nn.Module):
                            (1.0 - y_soft) * log_probs[:, 0])  # [B]
             if data_dict.get('mixup_selection') == 'mean':
                 K = data_dict['mixup_k']
-                mask_real = label == 0  # K*R samples
-                mask_fake = label == 1  # F samples
-                real_losses = per_sample[mask_real].view(K, -1).mean(dim=0)  # [R]
-                fake_losses = per_sample[mask_fake]  # [F]
-                loss = torch.cat([real_losses, fake_losses]).mean()
+                n_rf = data_dict.get('n_rf', 0)
+                mask_real = label == 0
+                mask_fake = label == 1
+                real_all = per_sample[mask_real]
+                # rr (real+real) first, then K * n_rf rf candidates
+                n_rr = len(real_all) - K * n_rf
+                rr_losses = real_all[:n_rr]
+                rf_losses = real_all[n_rr:].view(K, n_rf).mean(dim=0)  # [n_rf]
+                fake_losses = per_sample[mask_fake]
+                loss = torch.cat([rr_losses, rf_losses, fake_losses]).mean()
             else:
                 loss = per_sample.mean()
         else:
@@ -274,14 +279,17 @@ class EffortDetector(nn.Module):
         return loss_dict
 
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
-        label = data_dict['label']
         prob = pred_dict['prob']
 
+        if 'label_soft' in data_dict:
+            label_for_acc = (data_dict['label_soft'] >= 0.5).long()
+        else:
+            label_for_acc = data_dict['label']
         pred_label = (prob > 0.5).long()
-        correct = (pred_label == label.detach()).sum().item()
-        acc = correct / len(label)
+        correct = (pred_label == label_for_acc).sum().item()
+        acc = correct / len(label_for_acc)
 
-        auc, eer, _, ap = calculate_metrics_for_train(label.detach(), pred_dict['cls'].detach())
+        auc, eer, _, ap = calculate_metrics_for_train(label_for_acc.detach(), pred_dict['cls'].detach())
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
         return metric_batch_dict
 

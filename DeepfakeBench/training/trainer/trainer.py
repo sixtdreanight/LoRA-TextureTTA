@@ -61,111 +61,137 @@ def asymmetric_mixup(x, y, alpha=1.0, gamma=5.0):
 
 def hardest_k_mixup(model, data_dict, K, alpha=1.0, gamma=5.0, selection='hardest'):
     """
-    For each real image in the batch, generate K fake mixing candidates.
-    selection='hardest': forward K*R (no grad), pick highest per-sample soft-CE loss.
-    selection='random':   pick one candidate uniformly at random.
-    selection='mean':     keep all K candidates, average loss per real in get_losses.
-
-    Falls back to asymmetric_mixup when K<=1 or the batch has only one class.
+    Built on top of asymmetric_mixup's randperm structure.
+    K-candidate replaces only real+fake (y_a=0, y_b=1) pairs.
+    real+real / fake+fake / fake+real pairs use shared-λ randperm (same as asymmetric_mixup).
     """
     x, y = data_dict['image'], data_dict['label']
     real_idx = (y == 0).nonzero(as_tuple=True)[0]   # [R]
     fake_idx = (y == 1).nonzero(as_tuple=True)[0]   # [F]
+    B = x.size(0)
+    R, F_orig = len(real_idx), len(fake_idx)
 
-    if K <= 1 or len(real_idx) == 0 or len(fake_idx) == 0:
+    if K <= 1 or R == 0 or F_orig == 0:
         mixed_x, label_soft = asymmetric_mixup(x, y, alpha, gamma)
         return {**data_dict, 'image': mixed_x, 'label_soft': label_soft}
 
-    R = len(real_idx)
+    # ── 1. Randperm base (shared λ, same structure as asymmetric_mixup) ────
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    lam_t = torch.tensor(lam, dtype=torch.float32, device=x.device)
+    index = torch.randperm(B, device=x.device)
 
-    # ── Sample independent lambda_j per candidate ──────────────────────────
-    lam_k = np.random.beta(alpha, alpha, size=K) if alpha > 0 else np.ones(K)
-    lam_t_k = x.new_tensor(lam_k).float()                                 # [K]
+    # Pairing-type masks (anchor → partner)
+    rr = (y == 0) & (y[index] == 0)   # real+real
+    ff = (y == 1) & (y[index] == 1)   # fake+fake
+    rf = (y == 0) & (y[index] == 1)   # real+fake → K-candidate
+    fr = (y == 1) & (y[index] == 0)   # fake+real → asymmetric
 
-    # Asymmetric soft label per candidate
-    soft_val_k = 1.0 - (lam_t_k ** gamma)                                 # [K]
+    # ── 2. Real+real (shared λ, randperm partner) ─────────────────────────
+    rr_x = lam_t * x[rr] + (1.0 - lam_t) * x[index[rr]]
+    rr_soft = torch.zeros(rr.sum().item(), device=x.device)
 
-    # ── Build K*R mixed images ─────────────────────────────────────────────
-    # cand_fake_global[k, r] = global batch index of the k-th fake candidate for real r
-    cand_fake_global = fake_idx[
-        torch.randint(len(fake_idx), (K, R), device=x.device)
-    ]                                                                     # [K, R]
-
-    x_real_rep = (x[real_idx]
-                  .unsqueeze(0)
-                  .expand(K, -1, -1, -1, -1)
-                  .reshape(K * R, *x.shape[1:]))                         # [K*R, C, H, W]
-    x_fake_rep = x[cand_fake_global.reshape(-1)]                         # [K*R, C, H, W]
-
-    # Expand lam to [K*R, 1, 1, 1] for per-candidate mixing
-    lam_exp = lam_t_k.view(K, 1, 1, 1, 1).expand(K, R, *x.shape[1:])
-    lam_exp = lam_exp.reshape(K * R, *x.shape[1:])                       # [K*R, C, H, W]
-    mixed_kr = lam_exp * x_real_rep + (1.0 - lam_exp) * x_fake_rep
-
-    # Expand soft_val to [K*R] for per-candidate loss
-    soft_val_exp = soft_val_k.view(K, 1).expand(K, R).reshape(-1)        # [K*R]
-
-    # ── Mean over K candidates: keep all, loss averaged in get_losses ──────
-    if selection == 'mean':
-        if len(fake_idx) > 0:
-            partner = real_idx[torch.randint(len(real_idx), (len(fake_idx),), device=x.device)]
-            lam_f = np.random.beta(alpha, alpha, size=len(fake_idx)) if alpha > 0 else np.ones(len(fake_idx))
-            lam_f_t = x.new_tensor(lam_f).float()
-            lam_exp_f = lam_f_t.view(-1, 1, 1, 1).expand(-1, *x.shape[1:])
-            mixed_fake = lam_exp_f * x[fake_idx] + (1.0 - lam_exp_f) * x[partner]
-            fake_soft = 1.0 - ((1.0 - lam_f_t) ** gamma)
-            new_x = torch.cat([mixed_kr, mixed_fake], dim=0)       # [K*R + F, ...]
-            new_label_soft = torch.cat([soft_val_exp, fake_soft], dim=0)
-            new_label = torch.cat([
-                torch.zeros(K * R, dtype=y.dtype, device=y.device),
-                y[fake_idx]
-            ], dim=0)
-        else:
-            new_x = mixed_kr
-            new_label_soft = soft_val_exp
-            new_label = torch.zeros(K * R, dtype=y.dtype, device=y.device)
-        return {**data_dict, 'image': new_x, 'label': new_label,
-                'label_soft': new_label_soft,
-                'mixup_k': K, 'mixup_selection': 'mean'}
-
-    # ── Selection forward pass (no gradient) ──────────────────────────────
-    model_module = model.module if hasattr(model, 'module') else model
-    with torch.no_grad():
-        feat_kr = model_module.features({**data_dict, 'image': mixed_kr})  # [K*R, D]
-        pred_kr = model_module.classifier(feat_kr)                          # [K*R, 2]
-
-    log_p   = F.log_softmax(pred_kr, dim=1)                               # [K*R, 2]
-    loss_kr = -(soft_val_exp * log_p[:, 1] +
-                (1.0 - soft_val_exp) * log_p[:, 0])                       # [K*R]
-
-    # ── Pick candidate per real (hardest or random) ────────────────────────
-    # Layout of mixed_kr: [k*R + r] → (k, r)
-    if selection == 'random':
-        best_k = torch.randint(0, K, (R,), device=x.device)              # [R]
+    # ── 3. Fake+fake (shared λ, randperm partner) ─────────────────────────
+    n_ff = ff.sum().item()
+    if n_ff > 0:
+        ff_x = lam_t * x[ff] + (1.0 - lam_t) * x[index[ff]]
+        ff_soft = torch.ones(n_ff, device=x.device)
     else:
-        best_k = loss_kr.view(K, R).argmax(dim=0)                        # [R]
-    flat_idx  = best_k * R + torch.arange(R, device=x.device)            # [R]
-    selected  = mixed_kr[flat_idx]                                         # [R, C, H, W]
-    # Select corresponding soft labels for the chosen candidates
-    selected_soft = soft_val_exp[flat_idx]                                 # [R]
+        ff_x = torch.empty(0, *x.shape[1:], device=x.device)
+        ff_soft = torch.empty(0, device=x.device)
 
-    # ── Reconstruct full batch ─────────────────────────────────────────────
-    new_x = x.clone()
-    new_x[real_idx] = selected
+    # ── 4. Fake+real (shared λ, randperm partner, asymmetric label) ───────
+    fr_idx = fr.nonzero(as_tuple=True)[0]
+    n_fr = len(fr_idx)
+    if n_fr > 0:
+        fr_x = lam_t * x[fr_idx] + (1.0 - lam_t) * x[index[fr_idx]]
+        fr_soft = (1.0 - ((1.0 - lam_t) ** gamma)).expand(n_fr)
+    else:
+        fr_x = torch.empty(0, *x.shape[1:], device=x.device)
+        fr_soft = torch.empty(0, device=x.device)
 
-    label_soft = y.float().clone()
-    label_soft[real_idx] = selected_soft
+    # ── 5. Real+fake K-candidate (replaces randperm rf pairs) ──────────────
+    rf_idx = rf.nonzero(as_tuple=True)[0]
+    n_rf = len(rf_idx)
 
-    # ── Also mix fake images with random real images (keep distribution symmetric) ──
-    if len(fake_idx) > 0 and len(real_idx) > 0:
-        partner = real_idx[torch.randint(len(real_idx), (len(fake_idx),), device=x.device)]
-        lam_f = np.random.beta(alpha, alpha, size=len(fake_idx)) if alpha > 0 else np.ones(len(fake_idx))
-        lam_f_t = x.new_tensor(lam_f).float()
-        lam_exp_f = lam_f_t.view(-1, 1, 1, 1).expand(-1, *x.shape[1:])
-        new_x[fake_idx] = lam_exp_f * x[fake_idx] + (1.0 - lam_exp_f) * x[partner]
-        label_soft[fake_idx] = 1.0 - ((1.0 - lam_f_t) ** gamma)
+    if n_rf == 0:
+        parts_x = [x for x in [rr_x, ff_x, fr_x] if x is not None and x.numel() > 0]
+        parts_soft = [s for s in [rr_soft, ff_soft, fr_soft] if s is not None and s.numel() > 0]
+        parts_label = [
+            torch.zeros(rr.sum().item(), dtype=y.dtype, device=x.device),
+            torch.ones(n_ff, dtype=y.dtype, device=x.device) if n_ff > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+            y[fr_idx] if n_fr > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+        ]
+        new_x = torch.cat(parts_x, dim=0)
+        new_label_soft = torch.cat(parts_soft, dim=0)
+        new_label = torch.cat(parts_label, dim=0)
+        return {**data_dict, 'image': new_x, 'label': new_label, 'label_soft': new_label_soft}
 
-    return {**data_dict, 'image': new_x, 'label_soft': label_soft}
+    K_eff = min(K, F_orig)
+
+    # K distinct fakes per rf-real (without replacement)
+    cand_fake = torch.stack([
+        fake_idx[torch.randperm(F_orig, device=x.device)[:K_eff]]
+        for _ in range(n_rf)
+    ], dim=1)                                                             # [K_eff, n_rf]
+
+    # Per-(k,r) independent λ
+    lam_kr = np.random.beta(alpha, alpha, size=(K_eff, n_rf)) if alpha > 0 else np.ones((K_eff, n_rf))
+    lam_t_kr = x.new_tensor(lam_kr).float()                               # [K_eff, n_rf]
+    soft_val_kr = 1.0 - (lam_t_kr ** gamma)                                # [K_eff, n_rf]
+
+    # Build K_eff * n_rf mixed images
+    x_real_rep = (x[rf_idx]
+                  .unsqueeze(0)
+                  .expand(K_eff, -1, -1, -1, -1)
+                  .reshape(K_eff * n_rf, *x.shape[1:]))
+    x_fake_rep = x[cand_fake.reshape(-1)]
+    lam_exp = lam_t_kr.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, *x.shape[1:])
+    lam_exp = lam_exp.reshape(K_eff * n_rf, *x.shape[1:])
+    mixed_kr = lam_exp * x_real_rep + (1.0 - lam_exp) * x_fake_rep
+    soft_val_exp = soft_val_kr.reshape(-1)                                 # [K_eff * n_rf]
+
+    if selection == 'mean':
+        new_x = torch.cat([rr_x, ff_x, fr_x, mixed_kr], dim=0)
+        new_label_soft = torch.cat([rr_soft, ff_soft, fr_soft, soft_val_exp], dim=0)
+        new_label = torch.cat([
+            torch.zeros(rr.sum().item(), dtype=y.dtype, device=x.device),
+            torch.ones(n_ff, dtype=y.dtype, device=x.device) if n_ff > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+            y[fr_idx] if n_fr > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+            torch.zeros(K_eff * n_rf, dtype=y.dtype, device=x.device),
+        ], dim=0)
+        return {**data_dict, 'image': new_x, 'label': new_label,
+                'label_soft': new_label_soft, 'n_rf': n_rf,
+                'mixup_k': K_eff, 'mixup_selection': 'mean'}
+
+    # ── Select candidate per rf-real (random or hardest) ──────────────────
+    if selection == 'random':
+        best_k = torch.randint(0, K_eff, (n_rf,), device=x.device)
+    else:  # hardest
+        model_module = model.module if hasattr(model, 'module') else model
+        with torch.no_grad():
+            feat_kr = model_module.features({**data_dict, 'image': mixed_kr})
+            pred_kr = model_module.classifier(feat_kr)
+        log_p = F.log_softmax(pred_kr, dim=1)
+        loss_kr = -(soft_val_exp * log_p[:, 1] +
+                    (1.0 - soft_val_exp) * log_p[:, 0])
+        best_k = loss_kr.view(K_eff, n_rf).argmax(dim=0)
+
+    flat_idx = best_k * n_rf + torch.arange(n_rf, device=x.device)
+    rf_x = mixed_kr[flat_idx]
+    rf_soft = soft_val_exp[flat_idx]
+
+    # ── 6. Combine all ────────────────────────────────────────────────────
+    new_x = torch.cat([rr_x, ff_x, fr_x, rf_x], dim=0)
+    new_label_soft = torch.cat([rr_soft, ff_soft, fr_soft, rf_soft], dim=0)
+    new_label = torch.cat([
+        torch.zeros(rr.sum().item(), dtype=y.dtype, device=x.device),
+        torch.ones(n_ff, dtype=y.dtype, device=x.device) if n_ff > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+        y[fr_idx] if n_fr > 0 else torch.empty(0, dtype=y.dtype, device=x.device),
+        torch.zeros(n_rf, dtype=y.dtype, device=x.device),
+    ], dim=0)
+
+    return {**data_dict, 'image': new_x, 'label': new_label,
+            'label_soft': new_label_soft}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -606,7 +632,7 @@ class Trainer(object):
 
             # Adaptive threshold (OWTTT) for zero-shot NTTA
             model_module = self.model.module if hasattr(self.model, 'module') else self.model
-            if hasattr(model_module, 'compute_adaptive_threshold'):
+            if self.config.get('use_adaptive_threshold', True) and hasattr(model_module, 'compute_adaptive_threshold'):
                 model_module.prediction_queue.extend(predictions_nps.tolist())
                 if len(model_module.prediction_queue) > 1000:
                     model_module.prediction_queue = model_module.prediction_queue[-1000:]

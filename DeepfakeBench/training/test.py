@@ -88,7 +88,7 @@ def choose_metric(config):
     return metric_scoring
 
 
-def test_one_dataset(model, data_loader):
+def test_one_dataset(model, data_loader, use_adaptive_threshold=True):
     prediction_lists = []
     feature_lists = []
     label_lists = []
@@ -105,16 +105,18 @@ def test_one_dataset(model, data_loader):
             data_dict['landmark'] = landmark.to(device)
 
         # model forward without considering gradient computation
-        predictions = inference(model, data_dict)
+        predictions = inference(model, data_dict, use_adaptive_threshold)
         label_lists += list(data_dict['label'].cpu().detach().numpy())
         prediction_lists += list(predictions['prob'].cpu().detach().numpy())
         feature_lists += list(predictions['feat'].cpu().detach().numpy())
 
     return np.array(prediction_lists), np.array(label_lists),np.array(feature_lists)
 
-def test_epoch(model, test_data_loaders):
+def test_epoch(model, test_data_loaders, config=None):
     # set model to eval mode
     model.eval()
+
+    use_adaptive = config.get('use_adaptive_threshold', True) if config else True
 
     # define test recorder
     metrics_all_datasets = {}
@@ -124,25 +126,26 @@ def test_epoch(model, test_data_loaders):
     for key in keys:
         data_dict = test_data_loaders[key].dataset.data_dict
         # 这里的 predictions_nps 是概率数组 [N]
-        predictions_nps, label_nps, feat_nps = test_one_dataset(model, test_data_loaders[key])
+        predictions_nps, label_nps, feat_nps = test_one_dataset(model, test_data_loaders[key], use_adaptive)
 
         # 保存概率与标签供 testall.py 画分布图使用
         np.save(f'/tmp/effort_probs_{key}.npy', np.stack([predictions_nps, label_nps], axis=1))
 
-        # 【核心修改点】：获取模型在跑完该数据集后最终稳定的动态阈值
-        final_adaptive_th = model.compute_adaptive_threshold()
-        
-        tqdm.write(f"Using Adaptive Threshold: {final_adaptive_th:.4f}")
-
-        pred_labels = (predictions_nps > final_adaptive_th).astype(int)
-        correct_acc = (pred_labels == label_nps).mean()
+        if use_adaptive:
+            final_adaptive_th = model.compute_adaptive_threshold()
+            tqdm.write(f"Using Adaptive Threshold: {final_adaptive_th:.4f}")
+            pred_labels = (predictions_nps > final_adaptive_th).astype(int)
+            correct_acc = (pred_labels == label_nps).mean()
+        else:
+            final_adaptive_th = 0.5
 
         # compute metric for each dataset
         metric_one_dataset = get_test_metrics(y_pred=predictions_nps, y_true=label_nps,
                                               img_names=data_dict['image'])
-        
-        metric_one_dataset['acc'] = correct_acc
-        metric_one_dataset['best_th'] = final_adaptive_th 
+
+        if use_adaptive:
+            metric_one_dataset['acc'] = correct_acc
+            metric_one_dataset['best_th'] = final_adaptive_th 
         
         metrics_all_datasets[key] = metric_one_dataset
 
@@ -162,16 +165,16 @@ def test_epoch(model, test_data_loaders):
 
 
 @torch.no_grad()
-def inference(model, data_dict):
-    
+def inference(model, data_dict, use_adaptive_threshold=True):
+
     predictions = model(data_dict, inference=True)
-    
-    # 维护动态阈值队列（写入模型自身队列，供 compute_adaptive_threshold 使用）
-    probs = predictions['prob'].detach().cpu().numpy().tolist()
-    model.prediction_queue.extend(probs)
-    if len(model.prediction_queue) > 512:
-        model.prediction_queue = model.prediction_queue[-512:]
-    
+
+    if use_adaptive_threshold:
+        probs = predictions['prob'].detach().cpu().numpy().tolist()
+        model.prediction_queue.extend(probs)
+        if len(model.prediction_queue) > 512:
+            model.prediction_queue = model.prediction_queue[-512:]
+
     return predictions       
     # predictions = model(data_dict, inference=True)
     # return predictions
@@ -278,7 +281,7 @@ def main():
 
 
     # start testing
-    best_metric = test_epoch(model, test_data_loaders)
+    best_metric = test_epoch(model, test_data_loaders, config)
     print('===> Test Done!')
 
 if __name__ == '__main__':

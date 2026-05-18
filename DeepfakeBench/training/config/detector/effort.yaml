@@ -110,6 +110,8 @@ margin_weight: 0.5
 optimizer_wrapper: null   # null | sam | pcgrad
 sam_rho: 0.05
 
+use_adaptive_threshold: true  # OWTTT dynamic threshold, set false to disable
+
 # Asymmetric Mixup
 use_mixup: true       # set true to enable, or pass --mixup_gamma on CLI
 mixup_mode: original  # 'original' = direct asymmetric_mixup, 'asymmetric' = K-candidate selection
